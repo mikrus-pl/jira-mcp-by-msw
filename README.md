@@ -10,7 +10,7 @@ MCP server for Jira Cloud with a constrained data abstraction, designed to avoid
 
 ## What It Does
 
-This server exposes eight tools:
+This server exposes eleven tools:
 
 1. `jira_get_issue`
 2. `jira_create_issue`
@@ -19,12 +19,15 @@ This server exposes eight tools:
 5. `jira_add_comment`
 6. `jira_link_issue`
 7. `jira_project_baseline`
-8. `jira_search_issues`
+8. `jira_list_sprints`
+9. `jira_assign_issue_to_sprint`
+10. `jira_search_issues_by_jql`
+11. `jira_search_issues`
 
 All tools intentionally use a focused issue model:
 
 - `summary`
-- `description` (plain text in tool I/O, converted to/from ADF internally)
+- `description` (default plain text; optional ADF mode for read/write)
 - `fixVersions`
 - `affectedVersions`
 - `status`
@@ -137,7 +140,7 @@ This is convenient for local dev and CLI runs.
 
 This repo uses `dotenv/config`, so it loads `.env` automatically on startup.
 
-### Codex App (UI) Example (Idioto-Odporne)
+### Codex App (UI) Example (Idiot-Proof / Idioto-Odporne)
 
 In Codex App, when you add a “custom MCP” server:
 
@@ -203,6 +206,33 @@ curl -sS -u "${JIRA_EMAIL}:${JIRA_API_TOKEN}" \
   "${JIRA_BASE_URL}/rest/api/3/myself" | head
 ```
 
+## Execution Identity And Key Permissions
+
+Important identity rule:
+
+- The MCP server does not have its own Jira identity.
+- The agent executes Jira actions as the Jira user from provided credentials (`JIRA_EMAIL` + `JIRA_API_TOKEN`, or `JIRA_AUTH_HEADER`).
+- Permissions, issue security, workflow rules, and audit trail are all evaluated against that user.
+
+Key permissions to verify:
+
+- For `jira_get_issue`, `jira_search_issues`, `jira_search_issues_by_jql`, `jira_project_baseline`
+  - Browse projects and issue visibility (including issue security levels).
+- For `jira_create_issue`
+  - Create issues in target project.
+- For `jira_update_issue`
+  - Edit issues.
+- For `jira_transition_issue`
+  - Transition issues.
+- For `jira_add_comment`
+  - Add comments.
+- For `jira_link_issue`
+  - Link issues.
+- For `jira_list_sprints`
+  - Access Scrum board(s) and their sprints.
+- For `jira_assign_issue_to_sprint`
+  - Edit issues and permission to manage sprint membership on the board (commonly Manage sprints).
+
 ## Run
 
 Development:
@@ -249,19 +279,28 @@ Input:
 - `issueKey`
 - `skipComments` (optional, default `false`)
 - `loadOnlyLast3Comments` (optional, default `true`; ignored when `skipComments=true`)
+- `descriptionFormat` (optional: `plain_text` | `adf`, default `plain_text`)
 
 Output:
 
 - one focused issue object including:
+  - `description` in the requested format
   - `parent`, `subtasks`, `linkedIssues`
   - `comments` (plain text bodies)
   - `commentsMeta` (`mode`, `total`, `returned`)
+- use `descriptionFormat=adf` only when exact rich-text structure is required
 
 ### `jira_create_issue`
 Input:
 
 - required: `projectKey`, `issueType`, `summary`
-- optional: `description`, `fixVersions`, `affectedVersions`, `priority`, `severity`, `status`
+- optional: `description`, `descriptionFormat`, `fixVersions`, `affectedVersions`, `priority`, `severity`, `status`
+
+Description mode:
+
+- if `descriptionFormat` is omitted or set to `plain_text`, `description` must be a string
+- if `descriptionFormat` is `adf`, `description` must be an ADF JSON document (or JSON string of it)
+- keep `plain_text` as default for token efficiency; switch to `adf` only for rich formatting preservation
 
 Behavior:
 
@@ -272,19 +311,28 @@ Behavior:
 Input:
 
 - required: `issueKey`
-- optional updates: `summary`, `description`, `fixVersions`, `affectedVersions`, `priority`, `severity`, `status`
+- optional updates: `summary`, `description`, `descriptionFormat`, `fixVersions`, `affectedVersions`, `priority`, `severity`, `status`
 - optional flags for returned issue: `skipComments`, `loadOnlyLast3Comments`
+
+Description mode:
+
+- if `descriptionFormat` is omitted or set to `plain_text`, `description` is plain text string
+- if `descriptionFormat` is `adf`, `description` must be an ADF JSON document (or JSON string of it)
+- use `description: null` to clear description
+- keep `plain_text` as default for token efficiency; use `adf` only when rich formatting must be preserved
 
 Behavior:
 
 - updates issue fields via Jira `Edit issue`
 - if `status` is provided, applies transition as a second step
+- sprint assignment is intentionally **not** done here (Jira ignores sprint updates in many setups via issue edit); use `jira_assign_issue_to_sprint`
 
 ### `jira_transition_issue`
 Input:
 
 - required: `issueKey`, `toStatus`
 - optional flags for returned issue: `skipComments`, `loadOnlyLast3Comments`
+- optional: `descriptionFormat` (`plain_text` | `adf`, default `plain_text`)
 
 Behavior:
 
@@ -323,11 +371,15 @@ Input:
 Output:
 
 - project info
-- issue types
-- priorities
-- versions
+- issue types (with textual descriptions)
+- priorities (id + name + description)
+- versions (only unreleased and not archived)
+- severity context:
+  - whether severity is configured
+  - configured field id / JQL field / value type
+  - allowed severity options with textual descriptions (when Jira metadata provides them)
 - field profile for business fields (`summary`, `description`, `fixVersions`, `affectedVersions`, `priority`, `severity`)
-- active sprint(s) from Scrum boards
+- active sprint(s) from Scrum boards, each with contextual description text (goal/state/dates/board)
 - workflow per issue type:
   - compact statuses list
   - compact `from -> to` transitions list (business-oriented)
@@ -338,6 +390,91 @@ Notes on workflow transitions:
 - Jira does not expose a single small “authoritative transition graph” for a project without pulling large workflow payloads.
 - This server infers a compact `from -> to` list by sampling transitions from recently updated issues per status.
 - Coverage metrics help you see how complete the inferred graph is for that issue type.
+
+### `jira_list_sprints`
+Input:
+
+- required: `projectKey`
+- optional: `state` (`active` | `future` | `closed` | `all`, default `active`)
+- optional: `boardName` (exact board name filter)
+- optional: `maxResultsPerBoard` (1..50, default `20`)
+
+Output:
+
+- sprint list with context-rich fields:
+  - `id`, `name`, `state`
+  - `description` (human-friendly text)
+  - `goal`, `startDate`, `endDate`
+  - `board` (`id`, `name`)
+
+### `jira_assign_issue_to_sprint`
+Input:
+
+- required: `issueKey`
+- choose one target selector:
+  - `sprintId` (recommended)
+  - `sprintName` (server resolves by name; errors if ambiguous)
+- optional disambiguation for `sprintName`: `projectKey`, `boardName`
+- optional response controls: `loadIssueAfterAssign`, `skipComments`, `loadOnlyLast3Comments`, `descriptionFormat`
+
+Behavior:
+
+- assigns issue using Jira Agile endpoint: `POST /rest/agile/1.0/sprint/{sprintId}/issue`
+- protects against invalid targeting (missing selector, ambiguous sprint name, closed sprint)
+- can return refreshed focused issue after successful assignment
+
+### ADF Quick Examples (Short)
+
+Use these only when you need to preserve rich formatting. Otherwise keep `plain_text` for lower token usage.
+
+Get issue in ADF:
+
+```json
+{
+  "issueKey": "PROJ-123",
+  "descriptionFormat": "adf"
+}
+```
+
+Create issue with ADF description:
+
+```json
+{
+  "projectKey": "PROJ",
+  "issueType": "Task",
+  "summary": "Formatted note",
+  "descriptionFormat": "adf",
+  "description": {
+    "type": "doc",
+    "version": 1,
+    "content": [
+      {
+        "type": "paragraph",
+        "content": [{ "type": "text", "text": "Hello from ADF" }]
+      }
+    ]
+  }
+}
+```
+
+Update issue with ADF description:
+
+```json
+{
+  "issueKey": "PROJ-123",
+  "descriptionFormat": "adf",
+  "description": {
+    "type": "doc",
+    "version": 1,
+    "content": [
+      {
+        "type": "paragraph",
+        "content": [{ "type": "text", "text": "Updated formatted content" }]
+      }
+    ]
+  }
+}
+```
 
 ### `jira_search_issues`
 Input:
@@ -350,9 +487,82 @@ Output:
 - focused issue list only (no full Jira field payload), including `parent/subtasks/linkedIssues`
 - `nextPageToken`
 
+### `jira_search_issues_by_jql`
+Input:
+
+- required: `jql` (raw JQL)
+
+Output:
+
+- strict, lightweight issue list only:
+  - `key`
+  - `summary`
+  - `fixVersions`
+  - `sprints`
+  - `assignee`
+  - `reporter`
+  - `priority`
+  - `status`
+- hard safety cap: max 50 returned items
+- if the query returns more than 50, response includes:
+  - `truncated: true`
+  - `notice: "Results truncated because results exceeded 50!"`
+
+Why:
+
+- this keeps broad JQL discovery context-safe for the agent
+- use `jira_get_issue` to inspect details (including `description`) for specific issue keys
+
+Example input:
+
+```json
+{
+  "jql": "project = PROJ AND statusCategory != Done ORDER BY updated DESC"
+}
+```
+
+Example output (<= 50 results):
+
+```json
+{
+  "jql": "project = PROJ AND statusCategory != Done ORDER BY updated DESC",
+  "issues": [
+    {
+      "key": "PROJ-123",
+      "summary": "Checkout fails on Safari",
+      "fixVersions": ["2026.02"],
+      "sprints": ["Sprint 42"],
+      "assignee": "Jane Doe",
+      "reporter": "John Smith",
+      "priority": "High",
+      "status": "In Progress"
+    }
+  ],
+  "truncated": false,
+  "notice": null,
+  "mode": "enhanced"
+}
+```
+
+Example output (> 50 results):
+
+```json
+{
+  "jql": "project = PROJ ORDER BY updated DESC",
+  "issues": ["...first 50 issues only..."],
+  "truncated": true,
+  "notice": "Results truncated because results exceeded 50!",
+  "mode": "enhanced"
+}
+```
+
+If JQL is invalid, Jira returns an API error (for example syntax error), and the tool returns it as an MCP tool error response instead of crashing the server process.
+
 ## Notes
 
-- Jira Cloud `description` is stored as ADF; this server abstracts it to plain text in tool-level I/O.
+- Jira Cloud `description` is stored as ADF.
+- Default mode is `plain_text` (for low token cost and simpler prompts).
+- You can opt into raw ADF with `descriptionFormat: "adf"` in `jira_get_issue`, `jira_create_issue`, and `jira_update_issue` when preserving rich formatting is required.
 - Jira comments are also ADF in Cloud API; server returns/sends plain text at tool boundary.
 - Default comment loading mode is last 3 comments to protect LLM context.
 - Severity is not a standard Jira system field in many projects; configure custom field mapping in env.
@@ -364,3 +574,4 @@ Output:
 - `403 Forbidden`: token user lacks permissions (browse project, transition issues, link issues, etc.).
 - Severity updates fail: set `JIRA_SEVERITY_FIELD_ID` and ensure `JIRA_SEVERITY_VALUE_TYPE` matches the field type.
 - Link creation fails with “Unknown link relation”: use a relation label that exists in your Jira instance (e.g. `blocks`, `is blocked by`, `relates to`). The server maps these labels to Jira link types.
+- Sprint not changing via issue update: this is expected in many Jira setups. Use `jira_assign_issue_to_sprint` (Agile API), not `jira_update_issue`.

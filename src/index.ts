@@ -9,9 +9,12 @@ import { loadJiraConfig } from "./config.js";
 import { JiraApiError, JiraClient } from "./jira-client.js";
 import type {
   AddCommentInput,
+  AssignIssueToSprintInput,
   CreateIssueInput,
   IssueReadOptions,
+  ListSprintsInput,
   LinkIssueInput,
+  SearchIssuesByJqlInput,
   SearchIssuesInput,
   TransitionIssueInput,
   UpdateIssueInput
@@ -19,6 +22,13 @@ import type {
 
 const nonEmpty = z.string().trim().min(1);
 const nonEmptyArray = z.array(nonEmpty).max(100);
+const descriptionFormatSchema = z
+  .enum(["plain_text", "adf"])
+  .optional()
+  .describe(
+    "Description format. plain_text: string text. adf: Atlassian Document Format JSON object. Default: plain_text."
+  );
+const descriptionInputSchema = z.union([z.string(), z.record(z.string(), z.unknown())]);
 
 const config = loadJiraConfig();
 const jira = new JiraClient(config);
@@ -33,7 +43,7 @@ server.registerTool(
   {
     title: "Get Jira Issue",
     description:
-      "Read one Jira issue by key with focused business fields, relations (parent/subtasks/links), and context-safe comments.",
+      "Read one focused Jira issue by key. Description defaults to plain_text and can be returned as ADF.",
     inputSchema: {
       issueKey: nonEmpty.describe("Jira issue key, e.g. PROJ-123"),
       skipComments: z
@@ -43,14 +53,15 @@ server.registerTool(
       loadOnlyLast3Comments: z
         .boolean()
         .optional()
-        .describe("If true, return only the 3 most recent comments. Default: true.")
+        .describe("If true, return only the 3 most recent comments. Default: true."),
+      descriptionFormat: descriptionFormatSchema
     }
   },
-  async ({ issueKey, skipComments, loadOnlyLast3Comments }) =>
+  async ({ issueKey, skipComments, loadOnlyLast3Comments, descriptionFormat }) =>
     runTool(async () => ({
       issue: await jira.getIssue(
         issueKey,
-        buildIssueReadOptions({ skipComments, loadOnlyLast3Comments })
+        buildIssueReadOptions({ skipComments, loadOnlyLast3Comments, descriptionFormat })
       )
     }))
 );
@@ -60,15 +71,17 @@ server.registerTool(
   {
     title: "Create Jira Issue",
     description:
-      "Create a Jira issue using focused fields only. Optionally sets status via transition after create.",
+      "Create a focused Jira issue. Description accepts plain_text by default or ADF when requested.",
     inputSchema: {
       projectKey: nonEmpty.describe("Project key, e.g. PROJ"),
       issueType: nonEmpty.describe("Issue type name or id, e.g. Task, Bug, Story"),
       summary: nonEmpty.describe("Issue summary/title"),
-      description: z
-        .string()
+      description: descriptionInputSchema
         .optional()
-        .describe("Plain text description. Server converts this to Atlassian Document Format."),
+        .describe(
+          "Description content. Use plain text string by default, or an ADF JSON object when descriptionFormat=adf."
+        ),
+      descriptionFormat: descriptionFormatSchema,
       fixVersions: nonEmptyArray
         .optional()
         .describe("Optional list of project version names or ids for fixVersions."),
@@ -103,15 +116,17 @@ server.registerTool(
   {
     title: "Update Jira Issue",
     description:
-      "Update focused Jira issue fields. Optionally transitions status and controls comment loading in response.",
+      "Update focused Jira fields. Description supports plain_text (default) or ADF; optional status transition.",
     inputSchema: {
       issueKey: nonEmpty.describe("Jira issue key, e.g. PROJ-123"),
       summary: z.string().trim().min(1).optional(),
-      description: z
-        .string()
+      description: descriptionInputSchema
         .nullable()
         .optional()
-        .describe("Plain text description. Use null to clear."),
+        .describe(
+          "Description update. Use plain text string by default, ADF object when descriptionFormat=adf, or null to clear."
+        ),
+      descriptionFormat: descriptionFormatSchema,
       fixVersions: nonEmptyArray
         .optional()
         .describe("Set fixVersions by version names/ids. Use [] to clear."),
@@ -160,7 +175,7 @@ server.registerTool(
   {
     title: "Transition Jira Issue",
     description:
-      "Move a Jira issue to another status via workflow transition and return focused issue data.",
+      "Move issue to another status via workflow transition and return focused issue data.",
     inputSchema: {
       issueKey: nonEmpty.describe("Jira issue key, e.g. PROJ-123"),
       toStatus: nonEmpty.describe("Target status name or transition id."),
@@ -171,7 +186,8 @@ server.registerTool(
       loadOnlyLast3Comments: z
         .boolean()
         .optional()
-        .describe("If true, return only 3 most recent comments in returned issue. Default: true.")
+        .describe("If true, return only 3 most recent comments in returned issue. Default: true."),
+      descriptionFormat: descriptionFormatSchema
     }
   },
   async (args) => runTool(async () => jira.transitionIssue(args as TransitionIssueInput))
@@ -224,6 +240,96 @@ server.registerTool(
   },
   async ({ projectKey }) =>
     runTool(async () => ({ baseline: await jira.getProjectBaseline(projectKey) }))
+);
+
+server.registerTool(
+  "jira_list_sprints",
+  {
+    title: "List Jira Sprints",
+    description:
+      "List scrum sprints for a project with clear textual context (state, goal, dates, board).",
+    inputSchema: {
+      projectKey: nonEmpty.describe("Project key, e.g. PROJ"),
+      state: z
+        .enum(["active", "future", "closed", "all"])
+        .optional()
+        .describe("Sprint state filter. Default: active."),
+      boardName: z
+        .string()
+        .trim()
+        .min(1)
+        .optional()
+        .describe("Optional exact board name filter."),
+      maxResultsPerBoard: z
+        .number()
+        .int()
+        .min(1)
+        .max(50)
+        .optional()
+        .describe("How many sprints to fetch per board. Default: 20.")
+    }
+  },
+  async (args) => runTool(async () => jira.listSprints(args as ListSprintsInput))
+);
+
+server.registerTool(
+  "jira_assign_issue_to_sprint",
+  {
+    title: "Assign Jira Issue To Sprint",
+    description:
+      "Assign issue to sprint via Jira Agile API. Use sprintId (preferred) or sprintName.",
+    inputSchema: {
+      issueKey: nonEmpty.describe("Jira issue key, e.g. PROJ-123"),
+      sprintId: z.number().int().positive().optional().describe("Target sprint id."),
+      sprintName: z
+        .string()
+        .trim()
+        .min(1)
+        .optional()
+        .describe("Target sprint name (used when sprintId is not provided)."),
+      projectKey: z
+        .string()
+        .trim()
+        .min(1)
+        .optional()
+        .describe("Optional project key for sprintName lookup. If omitted, server resolves from issue."),
+      boardName: z
+        .string()
+        .trim()
+        .min(1)
+        .optional()
+        .describe("Optional exact board name filter when sprintName is used."),
+      loadIssueAfterAssign: z
+        .boolean()
+        .optional()
+        .describe("If true (default), returns refreshed focused issue after assignment."),
+      skipComments: z
+        .boolean()
+        .optional()
+        .describe("If loadIssueAfterAssign=true, skip comments in returned issue. Default: false."),
+      loadOnlyLast3Comments: z
+        .boolean()
+        .optional()
+        .describe("If loadIssueAfterAssign=true, return only last 3 comments. Default: true."),
+      descriptionFormat: descriptionFormatSchema.describe(
+        "If loadIssueAfterAssign=true, choose description output format. Default: plain_text."
+      )
+    }
+  },
+  async (args) => runTool(async () => jira.assignIssueToSprint(args as AssignIssueToSprintInput))
+);
+
+server.registerTool(
+  "jira_search_issues_by_jql",
+  {
+    title: "Search Jira Issues By JQL (Safe List)",
+    description:
+      "Run raw JQL and return a strict, context-safe list only: key, summary, fixVersions, sprints, assignee, reporter, priority, status. Hard limit: 50 results.",
+    inputSchema: {
+      jql: nonEmpty.describe("Raw Jira JQL query.")
+    }
+  },
+  async ({ jql }) => runTool(async () => jira.searchIssuesByJql({ jql } as SearchIssuesByJqlInput))
 );
 
 server.registerTool(
@@ -294,6 +400,7 @@ async function runTool<T>(operation: () => Promise<T>) {
 function buildIssueReadOptions(options: {
   skipComments?: boolean | undefined;
   loadOnlyLast3Comments?: boolean | undefined;
+  descriptionFormat?: "plain_text" | "adf" | undefined;
 }): IssueReadOptions {
   return {
     ...(typeof options.skipComments === "boolean"
@@ -301,7 +408,8 @@ function buildIssueReadOptions(options: {
       : {}),
     ...(typeof options.loadOnlyLast3Comments === "boolean"
       ? { loadOnlyLast3Comments: options.loadOnlyLast3Comments }
-      : {})
+      : {}),
+    ...(options.descriptionFormat ? { descriptionFormat: options.descriptionFormat } : {})
   };
 }
 

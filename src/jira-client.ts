@@ -3,21 +3,31 @@ import type { JiraConfig } from "./config.js";
 import type {
   AddCommentInput,
   AddCommentResult,
+  AssignIssueToSprintInput,
+  AssignIssueToSprintResult,
   BusinessFieldName,
   CompactIssueRef,
   CreateIssueInput,
   CreateIssueResult,
+  DescriptionFormat,
   FocusedIssue,
   IssueComment,
   IssueCommentsMeta,
+  IssueDescription,
   IssueReadOptions,
   IssueRef,
   IssueTransitionResult,
+  JqlIssueListItem,
+  ListSprintsInput,
+  ListSprintsResult,
   LinkIssueInput,
   LinkIssueResult,
   ProjectBaseline,
+  SearchIssuesByJqlInput,
+  SearchIssuesByJqlResult,
   SearchIssuesInput,
   SearchIssuesResult,
+  SprintStateFilter,
   TransitionIssueInput,
   TransitionIssueResult,
   UpdateIssueInput,
@@ -32,6 +42,8 @@ const BUSINESS_FIELDS: BusinessFieldName[] = [
   "priority",
   "severity"
 ];
+
+const JQL_RESULTS_TRUNCATED_NOTICE = "Results truncated because results exceeded 50!";
 
 interface JiraIssueResponse {
   key: string;
@@ -79,6 +91,12 @@ interface JiraBoardSearchResponse {
   }>;
 }
 
+interface JiraBoardResponse {
+  id?: number;
+  name?: string;
+  type?: string;
+}
+
 interface JiraSprintSearchResponse {
   values?: Array<{
     id?: number;
@@ -88,6 +106,17 @@ interface JiraSprintSearchResponse {
     startDate?: string;
     endDate?: string;
   }>;
+}
+
+interface JiraSprintResponse {
+  id?: number;
+  name?: string;
+  state?: string;
+  goal?: string;
+  startDate?: string;
+  endDate?: string;
+  originBoardId?: number;
+  boardId?: number;
 }
 
 interface JiraProjectStatusesEntry {
@@ -134,6 +163,7 @@ interface JiraCommentPageResponse {
 interface JiraPriority {
   id?: string;
   name?: string;
+  description?: string;
 }
 
 interface JiraPrioritySearchResponse {
@@ -204,7 +234,12 @@ export class JiraClient {
     );
 
     const commentsContext = await this.getIssueComments(issueKey, options);
-    return this.toFocusedIssue(issue, commentsContext.comments, commentsContext.meta);
+    return this.toFocusedIssue(
+      issue,
+      commentsContext.comments,
+      commentsContext.meta,
+      options.descriptionFormat
+    );
   }
 
   async createIssue(input: CreateIssueInput): Promise<CreateIssueResult> {
@@ -219,7 +254,7 @@ export class JiraClient {
     };
 
     if (input.description !== undefined) {
-      fields.description = plainTextToAdf(input.description);
+      fields.description = this.toJiraDescription(input.description, input.descriptionFormat);
     }
 
     if (fixVersionIds.length > 0) {
@@ -255,7 +290,9 @@ export class JiraClient {
       transition = await this.tryTransitionIssue(created.key, input.status);
     }
 
-    const issue = await this.getIssue(created.key);
+    const issue = await this.getIssue(created.key, {
+      ...(input.descriptionFormat ? { descriptionFormat: input.descriptionFormat } : {})
+    });
     return {
       issue,
       ...(transition ? { transition } : {})
@@ -275,7 +312,10 @@ export class JiraClient {
     }
 
     if (input.description !== undefined) {
-      fields.description = input.description === null ? null : plainTextToAdf(input.description);
+      fields.description =
+        input.description === null
+          ? null
+          : this.toJiraDescription(input.description, input.descriptionFormat);
     }
 
     const needsProjectKey =
@@ -347,7 +387,8 @@ export class JiraClient {
         : {}),
       ...(typeof input.loadOnlyLast3Comments === "boolean"
         ? { loadOnlyLast3Comments: input.loadOnlyLast3Comments }
-        : {})
+        : {}),
+      ...(input.descriptionFormat ? { descriptionFormat: input.descriptionFormat } : {})
     };
 
     const issue = await this.getIssue(issueKey, issueReadOptions);
@@ -367,7 +408,8 @@ export class JiraClient {
         : {}),
       ...(typeof input.loadOnlyLast3Comments === "boolean"
         ? { loadOnlyLast3Comments: input.loadOnlyLast3Comments }
-        : {})
+        : {}),
+      ...(input.descriptionFormat ? { descriptionFormat: input.descriptionFormat } : {})
     });
 
     return {
@@ -505,6 +547,140 @@ export class JiraClient {
     }
   }
 
+  async searchIssuesByJql(input: SearchIssuesByJqlInput): Promise<SearchIssuesByJqlResult> {
+    const jql = this.buildStrictJql(input.jql);
+    const issueFields = this.getIssueListFields();
+
+    try {
+      const response = await this.request<JiraEnhancedSearchResponse>("/rest/api/3/search/jql", {
+        method: "POST",
+        body: JSON.stringify({
+          jql,
+          maxResults: 51,
+          fields: issueFields,
+          fieldsByKeys: false
+        })
+      });
+
+      const rawIssues = response.issues ?? [];
+      const truncated = rawIssues.length > 50 || Boolean(response.nextPageToken);
+      const issues = rawIssues.slice(0, 50).map((issue) => this.toJqlIssueListItem(issue));
+
+      return {
+        jql,
+        issues,
+        truncated,
+        notice: truncated ? JQL_RESULTS_TRUNCATED_NOTICE : null,
+        mode: "enhanced"
+      };
+    } catch (error) {
+      if (!(error instanceof JiraApiError) || error.status !== 404) {
+        throw error;
+      }
+
+      const response = await this.request<JiraLegacySearchResponse>("/rest/api/3/search", {
+        method: "POST",
+        body: JSON.stringify({
+          jql,
+          maxResults: 51,
+          startAt: 0,
+          fields: issueFields,
+          fieldsByKeys: false
+        })
+      });
+
+      const rawIssues = response.issues ?? [];
+      const truncated = (response.total ?? 0) > 50 || rawIssues.length > 50;
+      const issues = rawIssues.slice(0, 50).map((issue) => this.toJqlIssueListItem(issue));
+
+      return {
+        jql,
+        issues,
+        truncated,
+        notice: truncated ? JQL_RESULTS_TRUNCATED_NOTICE : null,
+        mode: "legacy"
+      };
+    }
+  }
+
+  async listSprints(input: ListSprintsInput): Promise<ListSprintsResult> {
+    const projectKey = input.projectKey.trim();
+    if (!projectKey) {
+      throw new Error("projectKey cannot be empty.");
+    }
+
+    const state = this.normalizeSprintStateFilter(input.state);
+    const boardName = this.normalizeString(input.boardName) ?? null;
+    const maxResultsPerBoard = this.parseMaxResultsPerBoard(input.maxResultsPerBoard);
+
+    const boards = await this.fetchScrumBoards(projectKey, boardName ?? undefined);
+    if (boards.length === 0) {
+      return {
+        projectKey,
+        filter: {
+          state,
+          boardName,
+          maxResultsPerBoard
+        },
+        sprints: []
+      };
+    }
+
+    const sprints = await this.fetchSprintsFromBoards(boards, state, maxResultsPerBoard);
+
+    return {
+      projectKey,
+      filter: {
+        state,
+        boardName,
+        maxResultsPerBoard
+      },
+      sprints
+    };
+  }
+
+  async assignIssueToSprint(input: AssignIssueToSprintInput): Promise<AssignIssueToSprintResult> {
+    const issueKey = input.issueKey.trim();
+    if (!issueKey) {
+      throw new Error("issueKey cannot be empty.");
+    }
+
+    const sprint = await this.resolveSprintForAssignment(input, issueKey);
+    const normalizedState = sprint.state.trim().toLowerCase();
+    if (normalizedState === "closed") {
+      throw new Error(`Cannot assign issue to closed sprint ${sprint.id} (${sprint.name}).`);
+    }
+
+    await this.request<void>(`/rest/agile/1.0/sprint/${sprint.id}/issue`, {
+      method: "POST",
+      body: JSON.stringify({
+        issues: [issueKey]
+      })
+    });
+
+    const loadIssueAfterAssign = input.loadIssueAfterAssign ?? true;
+    if (!loadIssueAfterAssign) {
+      return {
+        issueKey,
+        sprint
+      };
+    }
+
+    const issue = await this.getIssue(issueKey, {
+      ...(typeof input.skipComments === "boolean" ? { skipComments: input.skipComments } : {}),
+      ...(typeof input.loadOnlyLast3Comments === "boolean"
+        ? { loadOnlyLast3Comments: input.loadOnlyLast3Comments }
+        : {}),
+      ...(input.descriptionFormat ? { descriptionFormat: input.descriptionFormat } : {})
+    });
+
+    return {
+      issueKey,
+      sprint,
+      issue
+    };
+  }
+
   async getProjectBaseline(projectKey: string): Promise<ProjectBaseline> {
     const project = await this.request<JiraProjectResponse>(
       `/rest/api/3/project/${encodeURIComponent(projectKey)}`
@@ -623,6 +799,13 @@ export class JiraClient {
       notes.push(`Active sprint lookup unavailable: ${toErrorMessage(error)}`);
     }
 
+    let severity: ProjectBaseline["severity"] = this.defaultSeverityContext();
+    try {
+      severity = await this.buildSeverityContext(projectKey);
+    } catch (error) {
+      notes.push(`Severity lookup unavailable: ${toErrorMessage(error)}`);
+    }
+
     return {
       project: {
         id: projectId,
@@ -633,6 +816,7 @@ export class JiraClient {
       priorities,
       versions,
       activeSprints,
+      severity,
       fieldProfile,
       workflow: {
         issueTypeFlows
@@ -864,7 +1048,8 @@ export class JiraClient {
 
           return {
             id: priority.id,
-            name: priority.name
+            name: priority.name,
+            description: priority.description?.trim() ?? ""
           };
         })
         .filter((value): value is NonNullable<typeof value> => Boolean(value));
@@ -886,7 +1071,8 @@ export class JiraClient {
 
         return {
           id: priority.id,
-          name: priority.name
+          name: priority.name,
+          description: priority.description?.trim() ?? ""
         };
       })
       .filter((value): value is NonNullable<typeof value> => Boolean(value));
@@ -903,11 +1089,17 @@ export class JiraClient {
           return null;
         }
 
+        const released = version.released ?? false;
+        const archived = version.archived ?? false;
+        if (released || archived) {
+          return null;
+        }
+
         return {
           id: version.id,
           name: version.name,
-          released: version.released ?? false,
-          archived: version.archived ?? false,
+          released,
+          archived,
           releaseDate: version.releaseDate ?? null
         };
       })
@@ -1167,58 +1359,105 @@ export class JiraClient {
   }
 
   private async fetchActiveSprints(projectKey: string): Promise<ProjectBaseline["activeSprints"]> {
+    const boards = await this.fetchScrumBoards(projectKey);
+    if (boards.length === 0) {
+      return [];
+    }
+
+    return this.fetchSprintsFromBoards(boards, "active", 10);
+  }
+
+  private normalizeSprintStateFilter(input: ListSprintsInput["state"]): SprintStateFilter {
+    const normalized = input?.trim().toLowerCase();
+    if (!normalized) {
+      return "active";
+    }
+
+    if (
+      normalized === "active" ||
+      normalized === "future" ||
+      normalized === "closed" ||
+      normalized === "all"
+    ) {
+      return normalized;
+    }
+
+    throw new Error("state must be one of: active, future, closed, all.");
+  }
+
+  private parseMaxResultsPerBoard(input: number | undefined): number {
+    if (input === undefined) {
+      return 20;
+    }
+
+    if (!Number.isInteger(input) || input < 1 || input > 50) {
+      throw new Error("maxResultsPerBoard must be an integer between 1 and 50.");
+    }
+
+    return input;
+  }
+
+  private async fetchScrumBoards(
+    projectKey: string,
+    boardName?: string
+  ): Promise<Array<{ id: number; name: string }>> {
     const boardQuery = new URLSearchParams({
       projectKeyOrId: projectKey,
       type: "scrum",
-      maxResults: "20"
+      maxResults: "50"
     });
 
     const boards = await this.request<JiraBoardSearchResponse>(
       `/rest/agile/1.0/board?${boardQuery.toString()}`
     );
 
-    const candidates = (boards.values ?? [])
+    const requestedBoardName = normalizeLabelForMatch(boardName);
+
+    return (boards.values ?? [])
       .map((board) => {
         if (typeof board.id !== "number" || !board.name) {
           return null;
         }
 
-        return { id: board.id, name: board.name };
+        if (
+          requestedBoardName &&
+          normalizeLabelForMatch(board.name) !== requestedBoardName
+        ) {
+          return null;
+        }
+
+        return {
+          id: board.id,
+          name: board.name
+        };
       })
       .filter((value): value is NonNullable<typeof value> => Boolean(value));
+  }
 
-    if (candidates.length === 0) {
-      return [];
-    }
+  private async fetchSprintsFromBoards(
+    boards: Array<{ id: number; name: string }>,
+    state: SprintStateFilter,
+    maxResultsPerBoard: number
+  ): Promise<ProjectBaseline["activeSprints"]> {
+    const stateQuery = this.toSprintStateQuery(state);
 
     const sprintCollections = await Promise.all(
-      candidates.map(async (board) => {
+      boards.map(async (board) => {
         try {
           const sprintQuery = new URLSearchParams({
-            state: "active",
-            maxResults: "10"
+            maxResults: String(maxResultsPerBoard)
           });
 
-          const sprints = await this.request<JiraSprintSearchResponse>(
+          if (stateQuery) {
+            sprintQuery.set("state", stateQuery);
+          }
+
+          const response = await this.request<JiraSprintSearchResponse>(
             `/rest/agile/1.0/board/${board.id}/sprint?${sprintQuery.toString()}`
           );
 
-          return (sprints.values ?? [])
-            .map((sprint) => {
-              if (typeof sprint.id !== "number" || !sprint.name || !sprint.state) {
-                return null;
-              }
-
-              return {
-                id: sprint.id,
-                name: sprint.name,
-                state: sprint.state,
-                goal: sprint.goal?.trim() ?? "",
-                startDate: sprint.startDate ?? null,
-                endDate: sprint.endDate ?? null,
-                board
-              };
-            })
+          return (response.values ?? [])
+            .map((sprint) => this.toSprintSummary(sprint, board))
             .filter((value): value is NonNullable<typeof value> => Boolean(value));
         } catch {
           return [];
@@ -1227,14 +1466,294 @@ export class JiraClient {
     );
 
     const deduped = new Map<number, ProjectBaseline["activeSprints"][number]>();
-
     for (const sprint of sprintCollections.flat()) {
       if (!deduped.has(sprint.id)) {
         deduped.set(sprint.id, sprint);
       }
     }
 
-    return [...deduped.values()];
+    return [...deduped.values()].sort((left, right) => {
+      const stateRank = this.sprintStateRank(left.state) - this.sprintStateRank(right.state);
+      if (stateRank !== 0) {
+        return stateRank;
+      }
+
+      return left.name.localeCompare(right.name);
+    });
+  }
+
+  private toSprintStateQuery(state: SprintStateFilter): string | null {
+    if (state === "active") {
+      return "active";
+    }
+
+    if (state === "all") {
+      return "active,future,closed";
+    }
+
+    return state;
+  }
+
+  private sprintStateRank(state: string): number {
+    const normalized = state.trim().toLowerCase();
+    if (normalized === "active") {
+      return 0;
+    }
+
+    if (normalized === "future") {
+      return 1;
+    }
+
+    if (normalized === "closed") {
+      return 2;
+    }
+
+    return 3;
+  }
+
+  private toSprintSummary(
+    sprint: JiraSprintResponse,
+    board: { id: number; name: string }
+  ): ProjectBaseline["activeSprints"][number] | null {
+    if (typeof sprint.id !== "number" || !sprint.name || !sprint.state) {
+      return null;
+    }
+
+    const goal = sprint.goal?.trim() ?? "";
+    const startDate = sprint.startDate ?? null;
+    const endDate = sprint.endDate ?? null;
+
+    return {
+      id: sprint.id,
+      name: sprint.name,
+      state: sprint.state,
+      description: this.buildSprintDescription({
+        name: sprint.name,
+        state: sprint.state,
+        goal,
+        startDate,
+        endDate,
+        boardName: board.name
+      }),
+      goal,
+      startDate,
+      endDate,
+      board
+    };
+  }
+
+  private buildSprintDescription(input: {
+    name: string;
+    state: string;
+    goal: string;
+    startDate: string | null;
+    endDate: string | null;
+    boardName: string;
+  }): string {
+    const dateWindow =
+      input.startDate || input.endDate
+        ? `${input.startDate ?? "unknown start"} -> ${input.endDate ?? "unknown end"}`
+        : "dates not set";
+
+    const goalText = input.goal ? `Goal: ${input.goal}` : "Goal: (empty)";
+    return `Sprint '${input.name}' on board '${input.boardName}' is '${input.state}'. ${goalText}. Dates: ${dateWindow}.`;
+  }
+
+  private async resolveSprintForAssignment(
+    input: AssignIssueToSprintInput,
+    issueKey: string
+  ): Promise<ProjectBaseline["activeSprints"][number]> {
+    const hasSprintId = typeof input.sprintId === "number";
+    const hasSprintName = Boolean(input.sprintName?.trim());
+
+    if (hasSprintId && hasSprintName) {
+      throw new Error("Provide either sprintId or sprintName, not both.");
+    }
+
+    if (!hasSprintId && !hasSprintName) {
+      throw new Error("Provide sprintId or sprintName.");
+    }
+
+    if (typeof input.sprintId === "number") {
+      const sprintId = input.sprintId;
+      if (!Number.isInteger(sprintId) || sprintId <= 0) {
+        throw new Error("sprintId must be a positive integer.");
+      }
+
+      return this.fetchSprintById(sprintId);
+    }
+
+    const sprintName = input.sprintName?.trim();
+    if (!sprintName) {
+      throw new Error("sprintName cannot be empty.");
+    }
+
+    const projectKey = input.projectKey?.trim() || (await this.getIssueProjectKey(issueKey));
+    const sprintsResult = await this.listSprints({
+      projectKey,
+      state: "all",
+      ...(input.boardName?.trim() ? { boardName: input.boardName.trim() } : {}),
+      maxResultsPerBoard: 50
+    });
+
+    const normalizedRequested = normalizeLabelForMatch(sprintName);
+    const matches = sprintsResult.sprints.filter(
+      (sprint) => normalizeLabelForMatch(sprint.name) === normalizedRequested
+    );
+
+    if (matches.length === 0) {
+      const preview = sprintsResult.sprints
+        .slice(0, 20)
+        .map((sprint) => `${sprint.id}:${sprint.name} (${sprint.state})`)
+        .join(", ");
+
+      throw new Error(
+        `Sprint '${sprintName}' not found for project ${projectKey}. Available sprints: ${preview || "(none)"}.`
+      );
+    }
+
+    if (matches.length > 1) {
+      const details = matches
+        .map((sprint) => `${sprint.id}:${sprint.name} on '${sprint.board.name}' (${sprint.state})`)
+        .join(", ");
+
+      throw new Error(
+        `Sprint name '${sprintName}' is ambiguous. Use sprintId. Matches: ${details}.`
+      );
+    }
+
+    const first = matches[0];
+    if (!first) {
+      throw new Error("Unexpected sprint selection error.");
+    }
+
+    return first;
+  }
+
+  private async fetchSprintById(sprintId: number): Promise<ProjectBaseline["activeSprints"][number]> {
+    const sprint = await this.request<JiraSprintResponse>(
+      `/rest/agile/1.0/sprint/${encodeURIComponent(String(sprintId))}`
+    );
+
+    const boardId =
+      typeof sprint.originBoardId === "number"
+        ? sprint.originBoardId
+        : typeof sprint.boardId === "number"
+          ? sprint.boardId
+          : null;
+
+    let boardName = boardId !== null ? `Board ${boardId}` : "Unknown board";
+    if (boardId !== null) {
+      try {
+        const board = await this.request<JiraBoardResponse>(
+          `/rest/agile/1.0/board/${encodeURIComponent(String(boardId))}`
+        );
+        boardName = this.normalizeString(board.name) ?? boardName;
+      } catch {
+        // Keep fallback board name.
+      }
+    }
+
+    const summary = this.toSprintSummary(sprint, {
+      id: boardId ?? 0,
+      name: boardName
+    });
+
+    if (!summary) {
+      throw new Error(`Sprint ${sprintId} is missing mandatory fields in Jira response.`);
+    }
+
+    return summary;
+  }
+
+  private defaultSeverityContext(): ProjectBaseline["severity"] {
+    return {
+      configured: Boolean(this.config.severityFieldId),
+      fieldId: this.config.severityFieldId ?? null,
+      jqlField: this.config.severityJqlField,
+      valueType: this.config.severityValueType,
+      options: []
+    };
+  }
+
+  private async buildSeverityContext(projectKey: string): Promise<ProjectBaseline["severity"]> {
+    const context = this.defaultSeverityContext();
+    if (!this.config.severityFieldId) {
+      return context;
+    }
+
+    const metaByIssueType = await this.fetchCreateMetaFieldMap(projectKey);
+    const deduped = new Map<string, ProjectBaseline["severity"]["options"][number]>();
+
+    for (const fieldsMeta of metaByIssueType.values()) {
+      const severityMeta = fieldsMeta[this.config.severityFieldId];
+      const details = this.extractAllowedValueDetails(severityMeta?.allowedValues);
+
+      for (const detail of details) {
+        const key = `${detail.id ?? "_"}::${detail.value.toLowerCase()}`;
+        if (!deduped.has(key)) {
+          deduped.set(key, detail);
+        }
+      }
+    }
+
+    return {
+      ...context,
+      options: [...deduped.values()]
+    };
+  }
+
+  private extractAllowedValueDetails(
+    values: unknown[] | undefined
+  ): ProjectBaseline["severity"]["options"] {
+    if (!values || values.length === 0) {
+      return [];
+    }
+
+    const details: ProjectBaseline["severity"]["options"] = [];
+
+    for (const rawValue of values) {
+      if (rawValue && typeof rawValue === "object") {
+        const asRecord = rawValue as Record<string, unknown>;
+        const idValue = asRecord.id;
+        const id =
+          this.normalizeString(idValue) ??
+          (typeof idValue === "number" ? String(idValue) : null);
+
+        const value =
+          this.normalizeString(asRecord.value) ??
+          this.normalizeString(asRecord.name) ??
+          this.normalizeString(asRecord.label) ??
+          this.extractScalarValue(rawValue);
+
+        if (!value) {
+          continue;
+        }
+
+        details.push({
+          id,
+          value,
+          description: this.normalizeString(asRecord.description) ?? ""
+        });
+      } else {
+        const scalar = this.extractScalarValue(rawValue);
+        if (!scalar) {
+          continue;
+        }
+
+        details.push({
+          id: null,
+          value: scalar,
+          description: ""
+        });
+      }
+
+      if (details.length >= 60) {
+        break;
+      }
+    }
+
+    return details;
   }
 
   private buildJql(input: SearchIssuesInput): string {
@@ -1310,6 +1829,20 @@ export class JiraClient {
     return jql;
   }
 
+  private buildStrictJql(rawJql: string): string {
+    const jql = rawJql.trim();
+
+    if (!jql) {
+      throw new Error("jql cannot be empty.");
+    }
+
+    if (!/\border\s+by\b/i.test(jql)) {
+      return `${jql} ORDER BY updated DESC`;
+    }
+
+    return jql;
+  }
+
   private buildJqlListClause(field: string, values: string[] | undefined): string | null {
     const normalized = (values ?? [])
       .map((value) => value.trim())
@@ -1370,6 +1903,10 @@ export class JiraClient {
     }
 
     return fields;
+  }
+
+  private getIssueListFields(): string[] {
+    return ["summary", "fixVersions", "assignee", "reporter", "priority", "status", "sprint"];
   }
 
   private async resolveIssueTypeId(projectKey: string, requested: string): Promise<string> {
@@ -1599,7 +2136,8 @@ export class JiraClient {
       mode: "skip",
       total: 0,
       returned: 0
-    }
+    },
+    descriptionFormat?: DescriptionFormat
   ): FocusedIssue {
     const fields = issue.fields ?? {};
 
@@ -1615,7 +2153,7 @@ export class JiraClient {
     return {
       key: issue.key,
       summary: this.normalizeString(fields.summary) ?? "",
-      description: adfToPlainText(fields.description),
+      description: this.toDescriptionOutput(fields.description, descriptionFormat),
       fixVersions: this.extractNameList(fields.fixVersions),
       affectedVersions: this.extractNameList(fields.versions),
       status: this.extractStatus(statusRaw),
@@ -1628,6 +2166,121 @@ export class JiraClient {
       linkedIssues: this.extractLinkedIssues(fields.issuelinks),
       comments,
       commentsMeta
+    };
+  }
+
+  private toDescriptionOutput(
+    description: unknown,
+    descriptionFormat: DescriptionFormat | undefined
+  ): IssueDescription {
+    const format = this.normalizeDescriptionFormat(descriptionFormat);
+    if (format === "adf") {
+      return this.toAdfDocument(description);
+    }
+
+    return adfToPlainText(description);
+  }
+
+  private toJiraDescription(
+    description: IssueDescription,
+    descriptionFormat: DescriptionFormat | undefined
+  ): Record<string, unknown> {
+    const format = this.normalizeDescriptionFormat(descriptionFormat);
+
+    if (format === "adf") {
+      return this.parseAdfInput(description);
+    }
+
+    if (typeof description !== "string") {
+      throw new Error(
+        "description must be a string when descriptionFormat is plain_text (or omitted)."
+      );
+    }
+
+    return plainTextToAdf(description);
+  }
+
+  private normalizeDescriptionFormat(
+    descriptionFormat: DescriptionFormat | undefined
+  ): DescriptionFormat {
+    return descriptionFormat === "adf" ? "adf" : "plain_text";
+  }
+
+  private parseAdfInput(description: IssueDescription): Record<string, unknown> {
+    const parsed = this.parseAdfLikeValue(description);
+    if (!parsed || !this.isAdfDocument(parsed)) {
+      throw new Error(
+        "description must be a valid ADF document when descriptionFormat=adf. Expected object: { type: 'doc', version: 1, content: [...] }."
+      );
+    }
+
+    return parsed;
+  }
+
+  private toAdfDocument(value: unknown): Record<string, unknown> {
+    const parsed = this.parseAdfLikeValue(value);
+    if (!parsed || !this.isAdfDocument(parsed)) {
+      return {
+        type: "doc",
+        version: 1,
+        content: []
+      };
+    }
+
+    return parsed;
+  }
+
+  private parseAdfLikeValue(value: unknown): Record<string, unknown> | null {
+    if (!value) {
+      return null;
+    }
+
+    if (typeof value === "string") {
+      const trimmed = value.trim();
+      if (!trimmed) {
+        return null;
+      }
+
+      try {
+        const parsed = JSON.parse(trimmed);
+        if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+          return null;
+        }
+
+        return parsed as Record<string, unknown>;
+      } catch {
+        return null;
+      }
+    }
+
+    if (typeof value === "object" && !Array.isArray(value)) {
+      return value as Record<string, unknown>;
+    }
+
+    return null;
+  }
+
+  private isAdfDocument(value: Record<string, unknown>): boolean {
+    return (
+      this.normalizeString(value.type) === "doc" &&
+      typeof value.version === "number" &&
+      Array.isArray(value.content)
+    );
+  }
+
+  private toJqlIssueListItem(issue: JiraIssueResponse): JqlIssueListItem {
+    const fields = issue.fields ?? {};
+    const statusRaw = fields.status as Record<string, unknown> | undefined;
+
+    return {
+      key: issue.key,
+      summary: this.normalizeString(fields.summary) ?? "",
+      fixVersions: this.extractNameList(fields.fixVersions),
+      sprints: this.extractSprintNames(fields.sprint),
+      assignee: this.extractUserName(fields.assignee),
+      reporter: this.extractUserName(fields.reporter),
+      priority: this.extractScalarValue(fields.priority),
+      status: this.normalizeString(statusRaw?.name) ?? null
     };
   }
 
@@ -1755,6 +2408,46 @@ export class JiraClient {
     return value
       .map((entry) => this.extractScalarValue(entry))
       .filter((item): item is string => Boolean(item));
+  }
+
+  private extractSprintNames(value: unknown): string[] {
+    const names = new Set<string>();
+    const entries = Array.isArray(value) ? value : [value];
+
+    for (const entry of entries) {
+      const directName = this.normalizeString((entry as Record<string, unknown> | undefined)?.name);
+      if (directName) {
+        names.add(directName);
+        continue;
+      }
+
+      const rawValue = this.normalizeString(entry);
+      if (!rawValue) {
+        continue;
+      }
+
+      const match = rawValue.match(/name=([^,\]]+)/i);
+      if (match?.[1]) {
+        names.add(match[1].trim());
+      }
+    }
+
+    return [...names];
+  }
+
+  private extractUserName(value: unknown): string | null {
+    if (!value || typeof value !== "object") {
+      return null;
+    }
+
+    const user = value as Record<string, unknown>;
+    return (
+      this.normalizeString(user.displayName) ??
+      this.normalizeString(user.name) ??
+      this.normalizeString(user.emailAddress) ??
+      this.normalizeString(user.accountId) ??
+      null
+    );
   }
 
   private extractIssueRef(value: Record<string, unknown> | undefined): IssueRef | null {

@@ -3,6 +3,9 @@ export interface IssueRef {
   name?: string;
 }
 
+export type DescriptionFormat = "plain_text" | "adf";
+export type IssueDescription = string | Record<string, unknown>;
+
 export type CommentReadMode = "skip" | "last_3" | "all";
 
 export interface IssueComment {
@@ -25,6 +28,7 @@ export interface IssueCommentsMeta {
 export interface IssueReadOptions {
   skipComments?: boolean;
   loadOnlyLast3Comments?: boolean;
+  descriptionFormat?: DescriptionFormat;
 }
 
 export interface CompactIssueRef {
@@ -43,7 +47,7 @@ export interface LinkedIssueRef extends CompactIssueRef {
 export interface FocusedIssue {
   key: string;
   summary: string;
-  description: string;
+  description: IssueDescription;
   fixVersions: string[];
   affectedVersions: string[];
   status: {
@@ -74,7 +78,8 @@ export interface CreateIssueInput {
   projectKey: string;
   issueType: string;
   summary: string;
-  description?: string;
+  description?: IssueDescription;
+  descriptionFormat?: DescriptionFormat;
   fixVersions?: string[];
   affectedVersions?: string[];
   priority?: string;
@@ -90,7 +95,8 @@ export interface CreateIssueResult {
 export interface UpdateIssueInput extends IssueReadOptions {
   issueKey: string;
   summary?: string;
-  description?: string | null;
+  description?: IssueDescription | null;
+  descriptionFormat?: DescriptionFormat;
   fixVersions?: string[];
   affectedVersions?: string[];
   priority?: string | null;
@@ -162,6 +168,77 @@ export interface SearchIssuesResult {
   mode: "enhanced" | "legacy";
 }
 
+export interface JqlIssueListItem {
+  key: string;
+  summary: string;
+  fixVersions: string[];
+  sprints: string[];
+  assignee: string | null;
+  reporter: string | null;
+  priority: string | null;
+  status: string | null;
+}
+
+export interface SearchIssuesByJqlInput {
+  jql: string;
+}
+
+export interface SearchIssuesByJqlResult {
+  jql: string;
+  issues: JqlIssueListItem[];
+  truncated: boolean;
+  notice: string | null;
+  mode: "enhanced" | "legacy";
+}
+
+export type SprintStateFilter = "active" | "future" | "closed" | "all";
+
+export interface SprintSummary {
+  id: number;
+  name: string;
+  state: string;
+  description: string;
+  goal: string;
+  startDate: string | null;
+  endDate: string | null;
+  board: {
+    id: number;
+    name: string;
+  };
+}
+
+export interface ListSprintsInput {
+  projectKey: string;
+  state?: SprintStateFilter;
+  boardName?: string;
+  maxResultsPerBoard?: number;
+}
+
+export interface ListSprintsResult {
+  projectKey: string;
+  filter: {
+    state: SprintStateFilter;
+    boardName: string | null;
+    maxResultsPerBoard: number;
+  };
+  sprints: SprintSummary[];
+}
+
+export interface AssignIssueToSprintInput extends IssueReadOptions {
+  issueKey: string;
+  sprintId?: number;
+  sprintName?: string;
+  projectKey?: string;
+  boardName?: string;
+  loadIssueAfterAssign?: boolean;
+}
+
+export interface AssignIssueToSprintResult {
+  issueKey: string;
+  sprint: SprintSummary;
+  issue?: FocusedIssue;
+}
+
 export type BusinessFieldName =
   | "summary"
   | "description"
@@ -185,6 +262,7 @@ export interface ProjectBaseline {
   priorities: Array<{
     id: string;
     name: string;
+    description: string;
   }>;
   versions: Array<{
     id: string;
@@ -193,18 +271,18 @@ export interface ProjectBaseline {
     archived: boolean;
     releaseDate: string | null;
   }>;
-  activeSprints: Array<{
-    id: number;
-    name: string;
-    state: string;
-    goal: string;
-    startDate: string | null;
-    endDate: string | null;
-    board: {
-      id: number;
-      name: string;
-    };
-  }>;
+  activeSprints: SprintSummary[];
+  severity: {
+    configured: boolean;
+    fieldId: string | null;
+    jqlField: string;
+    valueType: "option" | "string" | "number";
+    options: Array<{
+      id: string | null;
+      value: string;
+      description: string;
+    }>;
+  };
   fieldProfile: Array<{
     issueType: {
       id: string;
