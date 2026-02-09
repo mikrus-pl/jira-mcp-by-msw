@@ -41,19 +41,11 @@ All tools intentionally use a focused issue model:
 - Node.js 22+
 - Jira Cloud account + API token (or a pre-built `Authorization` header)
 
-## Configuration: One Place Only
+## Configuration
 
-You do **not** need to set Jira credentials in two places.
+Use MCP client configuration only.
 
-Pick exactly one:
-
-1. **MCP client config** (recommended when using this as an MCP server)
-   - Put all `JIRA_*` variables under the MCP server `env` block.
-2. **Local `.env` file** (recommended for local development)
-   - Create `.env` next to `package.json`.
-   - This server loads `.env` automatically on startup.
-
-If you provide both, the MCP client's `env` usually wins because it is already present in `process.env` and `.env` loading does not override existing variables by default.
+- Put all `JIRA_*` variables under the MCP server `env` block.
 
 ## Get Jira Credentials (Step-By-Step)
 
@@ -79,10 +71,6 @@ curl -sS -u "${JIRA_EMAIL}:${JIRA_API_TOKEN}" \
 ```bash
 npm install
 npm run build
-
-# Optional (local dev / running from terminal):
-cp .env.example .env
-# edit .env
 ```
 
 ## Add This Server To An MCP Client (Step-By-Step)
@@ -92,7 +80,7 @@ This is a **stdio** MCP server. Most MCP clients need the same 4 things:
 1. **Transport**: `STDIO`
 2. **Command**: `node`
 3. **Arguments**: absolute path to `dist/index.js`
-4. **Environment variables**: `JIRA_*` (or use a local `.env`)
+4. **Environment variables**: `JIRA_*`
 
 ### Step 0: Build Once (Required)
 
@@ -113,9 +101,9 @@ To get the absolute path quickly:
 echo "$(pwd)/dist/index.js"
 ```
 
-### Option A (Recommended): Put `JIRA_*` In The MCP Client
+### MCP Client Setup
 
-This is the simplest and most reliable setup (no `.env` needed).
+Use `JIRA_*` directly in the MCP client.
 
 - `command`: `node`
 - `args`: `["/absolute/path/to/jira-mcp-by-msw/dist/index.js"]`
@@ -125,20 +113,6 @@ This is the simplest and most reliable setup (no `.env` needed).
 If your client has a single “command line” field instead of `command` + `args`, use:
 
 - `node /absolute/path/to/jira-mcp-by-msw/dist/index.js`
-
-### Option B: Use A Local `.env` File
-
-This is convenient for local dev and CLI runs.
-
-1. Create `.env` next to `package.json`:
-   - `cp .env.example .env`
-2. In the MCP client, set:
-   - `command`: `node`
-   - `args`: `["/absolute/path/to/jira-mcp-by-msw/dist/index.js"]`
-   - `workingDirectory`: `/absolute/path/to/jira-mcp-by-msw`
-   - `env`: leave empty (recommended, to avoid duplication)
-
-This repo uses `dotenv/config`, so it loads `.env` automatically on startup.
 
 ### Codex App (UI) Example (Idiot-Proof / Idioto-Odporne)
 
@@ -150,7 +124,7 @@ In Codex App, when you add a “custom MCP” server:
    - **Command to launch**: `node`
    - **Arguments**: `/absolute/path/to/jira-mcp-by-msw/dist/index.js`
    - **Environment variables** (recommended): add `JIRA_BASE_URL`, `JIRA_EMAIL`, `JIRA_API_TOKEN` (and optional `JIRA_SEVERITY_*`)
-   - **Working directory**: leave empty (if you used env vars) or set it to `/absolute/path/to/jira-mcp-by-msw` (if you want `.env` loading)
+   - **Working directory**: optional
 3. Save.
 
 How to verify it actually started:
