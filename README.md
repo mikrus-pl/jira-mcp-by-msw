@@ -38,6 +38,20 @@ All tools intentionally use a focused issue model:
 - Node.js 22+
 - Jira Cloud account + API token (or a pre-built `Authorization` header)
 
+## Configuration: One Place Only
+
+You do **not** need to set Jira credentials in two places.
+
+Pick exactly one:
+
+1. **MCP client config** (recommended when using this as an MCP server)
+   - Put all `JIRA_*` variables under the MCP server `env` block.
+2. **Local `.env` file** (recommended for local development)
+   - Create `.env` next to `package.json`.
+   - This server loads `.env` automatically on startup.
+
+If you provide both, the MCP client's `env` usually wins because it is already present in `process.env` and `.env` loading does not override existing variables by default.
+
 ## Get Jira Credentials (Step-By-Step)
 
 1. **Find your Jira base URL**
@@ -49,9 +63,11 @@ All tools intentionally use a focused issue model:
    - Use the email of your Atlassian account (the same account that can access the Jira site).
 4. **Optional: figure out the Severity custom field**
    - If your project uses a custom Severity field, find its field id (often `customfield_12345`).
-   - Quick way (requires auth):\n
+   - Quick way (requires auth):
 ```bash
-curl -sS -u \"${JIRA_EMAIL}:${JIRA_API_TOKEN}\" \\\n  \"${JIRA_BASE_URL}/rest/api/3/field\" | head\n```
+curl -sS -u "${JIRA_EMAIL}:${JIRA_API_TOKEN}" \
+  "${JIRA_BASE_URL}/rest/api/3/field" | head
+```
    - Search the output for a field whose `name` is something like `Severity` and use its `id`.
    - If the field is a select list, use `JIRA_SEVERITY_VALUE_TYPE=option` (default).
 
@@ -59,33 +75,133 @@ curl -sS -u \"${JIRA_EMAIL}:${JIRA_API_TOKEN}\" \\\n  \"${JIRA_BASE_URL}/rest/ap
 
 ```bash
 npm install
+npm run build
+
+# Optional (local dev / running from terminal):
 cp .env.example .env
 # edit .env
+```
+
+## Add This Server To An MCP Client (Step-By-Step)
+
+This is a **stdio** MCP server. Most MCP clients need the same 4 things:
+
+1. **Transport**: `STDIO`
+2. **Command**: `node`
+3. **Arguments**: absolute path to `dist/index.js`
+4. **Environment variables**: `JIRA_*` (or use a local `.env`)
+
+### Step 0: Build Once (Required)
+
+From the repo root:
+
+```bash
+npm install
 npm run build
 ```
+
+You should have `dist/index.js` afterwards.
+
+Important: in MCP clients, **use an absolute path** to `dist/index.js` (not `./dist/index.js`), because the client usually starts the server with its own working directory.
+
+To get the absolute path quickly:
+
+```bash
+echo "$(pwd)/dist/index.js"
+```
+
+### Option A (Recommended): Put `JIRA_*` In The MCP Client
+
+This is the simplest and most reliable setup (no `.env` needed).
+
+- `command`: `node`
+- `args`: `["/absolute/path/to/jira-mcp-by-msw/dist/index.js"]`
+- `env`: add your `JIRA_*` variables
+- `workingDirectory`: optional (can be empty)
+
+If your client has a single “command line” field instead of `command` + `args`, use:
+
+- `node /absolute/path/to/jira-mcp-by-msw/dist/index.js`
+
+### Option B: Use A Local `.env` File
+
+This is convenient for local dev and CLI runs.
+
+1. Create `.env` next to `package.json`:
+   - `cp .env.example .env`
+2. In the MCP client, set:
+   - `command`: `node`
+   - `args`: `["/absolute/path/to/jira-mcp-by-msw/dist/index.js"]`
+   - `workingDirectory`: `/absolute/path/to/jira-mcp-by-msw`
+   - `env`: leave empty (recommended, to avoid duplication)
+
+This repo uses `dotenv/config`, so it loads `.env` automatically on startup.
+
+### Codex App (UI) Example (Idioto-Odporne)
+
+In Codex App, when you add a “custom MCP” server:
+
+1. Select `STDIO`.
+2. Fill the fields like this:
+   - **Name**: `jira-focused` (any name is fine)
+   - **Command to launch**: `node`
+   - **Arguments**: `/absolute/path/to/jira-mcp-by-msw/dist/index.js`
+   - **Environment variables** (recommended): add `JIRA_BASE_URL`, `JIRA_EMAIL`, `JIRA_API_TOKEN` (and optional `JIRA_SEVERITY_*`)
+   - **Working directory**: leave empty (if you used env vars) or set it to `/absolute/path/to/jira-mcp-by-msw` (if you want `.env` loading)
+3. Save.
+
+How to verify it actually started:
+
+- Check the client logs; this server prints `jira-focused-cloud-mcp is running on stdio` to stderr on successful startup.
 
 ## Environment Variables
 
 Required:
 
-- `JIRA_BASE_URL` (for example `https://your-domain.atlassian.net`)
+- `JIRA_BASE_URL`
+  - What: Jira Cloud site URL, e.g. `https://your-domain.atlassian.net` (no trailing slash).
+  - Where: your Jira site address in the browser.
 - Auth option A (recommended for Jira Cloud):
   - `JIRA_EMAIL`
+    - What: Atlassian account email used to authenticate.
   - `JIRA_API_TOKEN`
+    - What: API token generated in Atlassian.
+    - Where: `https://id.atlassian.com/manage-profile/security/api-tokens`
 - Auth option B:
-  - `JIRA_AUTH_HEADER` (full `Authorization` header value, e.g. `Basic ...` or `Bearer ...`)
+  - `JIRA_AUTH_HEADER`
+    - What: full `Authorization` header value.
+    - Example: `Basic <base64(email:api_token)>` or `Bearer <token>`.
 
 Optional:
 
-- `JIRA_REQUEST_TIMEOUT_MS` (default `20000`)
-- `JIRA_SEVERITY_FIELD_ID` (for example `customfield_12345`)
-- `JIRA_SEVERITY_JQL_FIELD` (defaults to severity field id, otherwise `severity`)
-- `JIRA_SEVERITY_VALUE_TYPE` (`option` | `string` | `number`, default `option`)
+- `JIRA_REQUEST_TIMEOUT_MS`
+  - What: request timeout in milliseconds.
+  - Why: protects the MCP client from long-hanging Jira calls.
+  - Default: `20000`
+- `JIRA_SEVERITY_FIELD_ID`
+  - What: Jira field id to read/write Severity, e.g. `customfield_12345`.
+  - Why: many Jira projects do not have a built-in Severity field; this tells the server which field to use.
+  - Where: `/rest/api/3/field` list (see command above).
+- `JIRA_SEVERITY_JQL_FIELD`
+  - What: field identifier used in JQL filters for `jira_search_issues`.
+  - Default: `JIRA_SEVERITY_FIELD_ID`, otherwise `severity`.
+  - Typical values:
+    - `customfield_12345` (recommended if Severity is a custom field)
+    - `severity` (only if your Jira instance supports it as a JQL field)
+- `JIRA_SEVERITY_VALUE_TYPE`
+  - What: how to send Severity when setting/updating issues.
+  - Default: `option`
+  - Values:
+    - `option`: for select-list fields (sends `{ value: "..." }`)
+    - `string`: for free-text fields (sends `"..."`)
+    - `number`: for numeric fields (sends `123`)
 
 ### Verify Auth (Optional)
 
 ```bash
-curl -sS -u \"${JIRA_EMAIL}:${JIRA_API_TOKEN}\" \\\n  \"${JIRA_BASE_URL}/rest/api/3/myself\" | head\n```
+curl -sS -u "${JIRA_EMAIL}:${JIRA_API_TOKEN}" \
+  "${JIRA_BASE_URL}/rest/api/3/myself" | head
+```
 
 ## Run
 
@@ -102,7 +218,7 @@ npm run build
 npm start
 ```
 
-## MCP Client Config Example
+## MCP Client Config Example (Copy/Paste)
 
 Example MCP configuration (stdio):
 
