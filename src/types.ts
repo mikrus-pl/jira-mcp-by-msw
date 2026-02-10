@@ -40,6 +40,7 @@ export interface IssueReadOptions {
 
 export interface CompactIssueRef {
   key: string;
+  url: string;
   summary: string;
   status: string | null;
   issueType: string | null;
@@ -53,6 +54,7 @@ export interface LinkedIssueRef extends CompactIssueRef {
 
 export interface FocusedIssue {
   key: string;
+  url: string;
   summary: string;
   description: IssueDescription;
   fixVersions: string[];
@@ -147,6 +149,8 @@ export interface LinkIssueInput {
 export interface LinkIssueResult {
   issueKey: string;
   targetIssueKey: string;
+  issueUrl: string;
+  targetIssueUrl: string;
   relation: string;
   linkType: string;
   direction: "outward" | "inward";
@@ -177,6 +181,7 @@ export interface SearchIssuesResult {
 
 export interface JqlIssueListItem {
   key: string;
+  url: string;
   summary: string;
   fixVersions: string[];
   sprints: string[];

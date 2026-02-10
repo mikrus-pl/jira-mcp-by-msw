@@ -514,6 +514,8 @@ export class JiraClient {
     return {
       issueKey,
       targetIssueKey,
+      issueUrl: this.buildIssueBrowseUrl(issueKey),
+      targetIssueUrl: this.buildIssueBrowseUrl(targetIssueKey),
       relation: resolved.relation,
       linkType: resolved.linkType,
       direction: resolved.direction
@@ -2483,6 +2485,7 @@ export class JiraClient {
 
     return {
       key: issue.key,
+      url: this.buildIssueBrowseUrl(issue.key),
       summary: this.normalizeString(fields.summary) ?? "",
       description: this.toDescriptionOutput(fields.description, descriptionFormat),
       fixVersions: this.extractNameList(fields.fixVersions),
@@ -2605,6 +2608,7 @@ export class JiraClient {
 
     return {
       key: issue.key,
+      url: this.buildIssueBrowseUrl(issue.key),
       summary: this.normalizeString(fields.summary) ?? "",
       fixVersions: this.extractNameList(fields.fixVersions),
       sprints: this.extractSprintNames(fields.sprint),
@@ -2655,10 +2659,15 @@ export class JiraClient {
 
     return {
       key,
+      url: this.buildIssueBrowseUrl(key),
       summary,
       status: status ?? null,
       issueType: issueType ?? null
     };
+  }
+
+  private buildIssueBrowseUrl(issueKey: string): string {
+    return `${this.config.baseUrl}/browse/${encodeURIComponent(issueKey)}`;
   }
 
   private extractIssueRefsFromArray(value: unknown): CompactIssueRef[] {

@@ -27,6 +27,7 @@ This server exposes twelve tools:
 
 All tools intentionally use a focused issue model:
 
+- `url` (direct Jira UI link: `/browse/{issueKey}`)
 - `summary`
 - `description` (default plain text; optional ADF mode for read/write)
 - `fixVersions`
@@ -261,8 +262,9 @@ Input:
 Output:
 
 - one focused issue object including:
+  - `url` (clickable Jira issue link)
   - `description` in the requested format
-  - `parent`, `subtasks`, `linkedIssues`
+  - `parent`, `subtasks`, `linkedIssues` (each with own `url`)
   - `comments` (plain text bodies)
   - `commentsMeta` (`mode`, `total`, `returned`)
 - use `descriptionFormat=adf` only when exact rich-text structure is required
@@ -338,7 +340,7 @@ Input:
 Behavior:
 
 - creates issue link using business relation label
-- returns normalized relation, link type and direction
+- returns normalized relation, link type, direction, and clickable issue URLs (`issueUrl`, `targetIssueUrl`)
 
 ### `jira_project_baseline`
 Input:
@@ -482,7 +484,7 @@ Input:
 
 Output:
 
-- focused issue list only (no full Jira field payload), including `parent/subtasks/linkedIssues`
+- focused issue list only (no full Jira field payload), including `url` and `parent/subtasks/linkedIssues` with URLs
 - `nextPageToken`
 
 ### `jira_search_issues_by_jql`
@@ -494,6 +496,7 @@ Output:
 
 - strict, lightweight issue list only:
   - `key`
+  - `url`
   - `summary`
   - `fixVersions`
   - `sprints`
@@ -527,6 +530,7 @@ Example output (<= 50 results):
   "issues": [
     {
       "key": "PROJ-123",
+      "url": "https://your-domain.atlassian.net/browse/PROJ-123",
       "summary": "Checkout fails on Safari",
       "fixVersions": ["2026.02"],
       "sprints": ["Sprint 42"],
