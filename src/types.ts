@@ -6,6 +6,13 @@ export interface IssueRef {
 export type DescriptionFormat = "plain_text" | "adf";
 export type IssueDescription = string | Record<string, unknown>;
 
+export interface AssignableUser {
+  id: string;
+  name: string;
+  email: string | null;
+  assignedIssuesLast60Days?: number;
+}
+
 export type CommentReadMode = "skip" | "last_3" | "all";
 
 export interface IssueComment {
@@ -224,6 +231,20 @@ export interface ListSprintsResult {
   sprints: SprintSummary[];
 }
 
+export interface ListProjectAssignableUsersInput {
+  projectKey: string;
+  maxResults: number;
+  startAt?: number;
+}
+
+export interface ListProjectAssignableUsersResult {
+  projectKey: string;
+  activeOnly: true;
+  maxResults: number;
+  startAt: number;
+  users: AssignableUser[];
+}
+
 export interface AssignIssueToSprintInput extends IssueReadOptions {
   issueKey: string;
   sprintId?: number;
@@ -271,6 +292,7 @@ export interface ProjectBaseline {
     archived: boolean;
     releaseDate: string | null;
   }>;
+  assignableUsers: AssignableUser[];
   activeSprints: SprintSummary[];
   severity: {
     configured: boolean;

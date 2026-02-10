@@ -3,6 +3,7 @@ import type { JiraConfig } from "./config.js";
 import type {
   AddCommentInput,
   AddCommentResult,
+  AssignableUser,
   AssignIssueToSprintInput,
   AssignIssueToSprintResult,
   BusinessFieldName,
@@ -20,6 +21,8 @@ import type {
   JqlIssueListItem,
   ListSprintsInput,
   ListSprintsResult,
+  ListProjectAssignableUsersInput,
+  ListProjectAssignableUsersResult,
   LinkIssueInput,
   LinkIssueResult,
   ProjectBaseline,
@@ -144,6 +147,29 @@ interface JiraLegacySearchResponse {
   startAt?: number;
 }
 
+interface JiraIssueChangelogItem {
+  field?: string;
+  fieldId?: string;
+  to?: string;
+}
+
+interface JiraIssueChangelogHistory {
+  created?: string;
+  items?: JiraIssueChangelogItem[];
+}
+
+interface JiraIssueWithChangelogResponse extends JiraIssueResponse {
+  changelog?: {
+    histories?: JiraIssueChangelogHistory[];
+  };
+}
+
+interface JiraLegacySearchWithChangelogResponse {
+  issues?: JiraIssueWithChangelogResponse[];
+  total?: number;
+  startAt?: number;
+}
+
 interface JiraCommentResponse {
   id?: string;
   body?: unknown;
@@ -168,6 +194,13 @@ interface JiraPriority {
 
 interface JiraPrioritySearchResponse {
   values?: JiraPriority[];
+}
+
+interface JiraUser {
+  accountId?: string;
+  displayName?: string;
+  emailAddress?: string;
+  active?: boolean;
 }
 
 interface JiraMetaField {
@@ -639,6 +672,27 @@ export class JiraClient {
     };
   }
 
+  async listProjectAssignableUsers(
+    input: ListProjectAssignableUsersInput
+  ): Promise<ListProjectAssignableUsersResult> {
+    const projectKey = input.projectKey.trim();
+    if (!projectKey) {
+      throw new Error("projectKey cannot be empty.");
+    }
+
+    const maxResults = this.parseAssignableUsersMaxResults(input.maxResults);
+    const startAt = this.parseAssignableUsersStartAt(input.startAt);
+    const users = await this.fetchProjectAssignableUsers(projectKey, maxResults, startAt);
+
+    return {
+      projectKey,
+      activeOnly: true,
+      maxResults,
+      startAt,
+      users
+    };
+  }
+
   async assignIssueToSprint(input: AssignIssueToSprintInput): Promise<AssignIssueToSprintResult> {
     const issueKey = input.issueKey.trim();
     if (!issueKey) {
@@ -722,6 +776,22 @@ export class JiraClient {
       versions = await this.fetchProjectVersions(projectKey);
     } catch (error) {
       notes.push(`Versions lookup unavailable: ${toErrorMessage(error)}`);
+    }
+
+    let assignableUsers: ProjectBaseline["assignableUsers"] = [];
+    try {
+      const topAssignableUsers = await this.fetchTopAssignableUsersByRecentAssignments(projectKey, {
+        days: 60,
+        limit: 15
+      });
+      assignableUsers = topAssignableUsers.users;
+      if (topAssignableUsers.truncated) {
+        notes.push(
+          "Assignable users ranking used a bounded scan window for recent issue history; ranking may be partial."
+        );
+      }
+    } catch (error) {
+      notes.push(`Assignable users lookup unavailable: ${toErrorMessage(error)}`);
     }
 
     let workflowIssueTypeStatuses: WorkflowIssueTypeStatus[] = [];
@@ -815,6 +885,7 @@ export class JiraClient {
       issueTypes,
       priorities,
       versions,
+      assignableUsers,
       activeSprints,
       severity,
       fieldProfile,
@@ -1104,6 +1175,266 @@ export class JiraClient {
         };
       })
       .filter((value): value is NonNullable<typeof value> => Boolean(value));
+  }
+
+  private parseAssignableUsersMaxResults(input: number): number {
+    if (!Number.isInteger(input) || input < 1 || input > 200) {
+      throw new Error("maxResults must be an integer between 1 and 200.");
+    }
+
+    return input;
+  }
+
+  private parseAssignableUsersStartAt(input: number | undefined): number {
+    if (input === undefined) {
+      return 0;
+    }
+
+    if (!Number.isInteger(input) || input < 0) {
+      throw new Error("startAt must be an integer greater than or equal to 0.");
+    }
+
+    return input;
+  }
+
+  private async fetchProjectAssignableUsers(
+    projectKey: string,
+    maxResults: number,
+    startAt: number
+  ): Promise<AssignableUser[]> {
+    const users = await this.fetchProjectAssignableUsersPage(projectKey, maxResults, startAt);
+    return this.toActiveAssignableUsers(users);
+  }
+
+  private async fetchProjectAssignableUsersPage(
+    projectKey: string,
+    maxResults: number,
+    startAt: number
+  ): Promise<JiraUser[]> {
+    const query = new URLSearchParams({
+      project: projectKey,
+      maxResults: String(maxResults),
+      startAt: String(startAt)
+    });
+
+    let users: JiraUser[];
+    try {
+      users = await this.request<JiraUser[]>(
+        `/rest/api/3/user/assignable/search?${query.toString()}`
+      );
+    } catch (error) {
+      if (!(error instanceof JiraApiError) || error.status !== 400) {
+        throw error;
+      }
+
+      const fallbackQuery = new URLSearchParams({
+        projectKey,
+        maxResults: String(maxResults),
+        startAt: String(startAt)
+      });
+
+      users = await this.request<JiraUser[]>(
+        `/rest/api/3/user/assignable/search?${fallbackQuery.toString()}`
+      );
+    }
+
+    return users;
+  }
+
+  private toActiveAssignableUsers(users: JiraUser[]): AssignableUser[] {
+    const deduped = new Map<string, AssignableUser>();
+
+    for (const user of users) {
+      if (user.active !== true) {
+        continue;
+      }
+
+      const id = this.normalizeString(user.accountId);
+      if (!id || deduped.has(id)) {
+        continue;
+      }
+
+      deduped.set(id, {
+        id,
+        name: this.normalizeString(user.displayName) ?? "(no display name)",
+        email: this.normalizeString(user.emailAddress) ?? null
+      });
+    }
+
+    return [...deduped.values()];
+  }
+
+  private async fetchAllProjectAssignableUsers(
+    projectKey: string,
+    cap: number
+  ): Promise<AssignableUser[]> {
+    const pageSize = Math.min(200, Math.max(1, cap));
+    const deduped = new Map<string, AssignableUser>();
+    let startAt = 0;
+
+    while (deduped.size < cap) {
+      const page = await this.fetchProjectAssignableUsersPage(projectKey, pageSize, startAt);
+      if (page.length === 0) {
+        break;
+      }
+
+      const activeUsers = this.toActiveAssignableUsers(page);
+      for (const user of activeUsers) {
+        if (!deduped.has(user.id)) {
+          deduped.set(user.id, user);
+        }
+
+        if (deduped.size >= cap) {
+          break;
+        }
+      }
+
+      startAt += page.length;
+      if (page.length < pageSize) {
+        break;
+      }
+    }
+
+    return [...deduped.values()];
+  }
+
+  private async fetchTopAssignableUsersByRecentAssignments(
+    projectKey: string,
+    options: { days: number; limit: number }
+  ): Promise<{ users: AssignableUser[]; truncated: boolean }> {
+    const assignableUsers = await this.fetchAllProjectAssignableUsers(projectKey, 1000);
+    if (assignableUsers.length === 0) {
+      return {
+        users: [],
+        truncated: false
+      };
+    }
+
+    const recentCounts = await this.countRecentAssignedIssuesByUser(projectKey, options.days);
+    const scoredUsers = assignableUsers.map((user) => ({
+      ...user,
+      assignedIssuesLast60Days: recentCounts.counts.get(user.id) ?? 0
+    }));
+
+    scoredUsers.sort((left, right) => {
+      const scoreDiff =
+        (right.assignedIssuesLast60Days ?? 0) - (left.assignedIssuesLast60Days ?? 0);
+      if (scoreDiff !== 0) {
+        return scoreDiff;
+      }
+
+      return left.name.localeCompare(right.name);
+    });
+
+    return {
+      users: scoredUsers.slice(0, Math.max(1, options.limit)),
+      truncated: recentCounts.truncated
+    };
+  }
+
+  private async countRecentAssignedIssuesByUser(
+    projectKey: string,
+    days: number
+  ): Promise<{ counts: Map<string, number>; truncated: boolean }> {
+    const now = Date.now();
+    const windowStartMs = now - Math.max(1, days) * 24 * 60 * 60 * 1000;
+    const pageSize = 50;
+    const maxIssuesToScan = 500;
+    const countsByUser = new Map<string, Set<string>>();
+    const fallbackByCurrentAssignee = new Map<string, Set<string>>();
+
+    let startAt = 0;
+    let total = Number.POSITIVE_INFINITY;
+    let scannedIssues = 0;
+    let truncated = false;
+
+    while (startAt < total) {
+      if (scannedIssues >= maxIssuesToScan) {
+        truncated = true;
+        break;
+      }
+
+      const jql = [
+        `project = ${this.quoteJqlLiteral(projectKey)}`,
+        `updated >= -${days}d`,
+        "ORDER BY updated DESC"
+      ].join(" AND ");
+
+      const response = await this.request<JiraLegacySearchWithChangelogResponse>(
+        "/rest/api/3/search",
+        {
+          method: "POST",
+          body: JSON.stringify({
+            jql,
+            startAt,
+            maxResults: pageSize,
+            fields: ["assignee"],
+            fieldsByKeys: false,
+            expand: "changelog"
+          })
+        }
+      );
+
+      const issues = response.issues ?? [];
+      if (issues.length === 0) {
+        break;
+      }
+
+      total = response.total ?? startAt + issues.length;
+      scannedIssues += issues.length;
+
+      for (const issue of issues) {
+        const issueKey = issue.key;
+
+        const currentAssigneeId = this.normalizeString(
+          (issue.fields.assignee as Record<string, unknown> | undefined)?.accountId
+        );
+        if (currentAssigneeId) {
+          const set = fallbackByCurrentAssignee.get(currentAssigneeId) ?? new Set<string>();
+          set.add(issueKey);
+          fallbackByCurrentAssignee.set(currentAssigneeId, set);
+        }
+
+        for (const history of issue.changelog?.histories ?? []) {
+          const createdMs = Date.parse(history.created ?? "");
+          if (!Number.isFinite(createdMs) || createdMs < windowStartMs || createdMs > now) {
+            continue;
+          }
+
+          for (const item of history.items ?? []) {
+            const fieldKey =
+              normalizeLabelForMatch(this.normalizeString(item.field)) ||
+              normalizeLabelForMatch(this.normalizeString(item.fieldId));
+
+            if (fieldKey !== "assignee") {
+              continue;
+            }
+
+            const assigneeId = this.normalizeString(item.to);
+            if (!assigneeId) {
+              continue;
+            }
+
+            const set = countsByUser.get(assigneeId) ?? new Set<string>();
+            set.add(issueKey);
+            countsByUser.set(assigneeId, set);
+          }
+        }
+      }
+
+      startAt += issues.length;
+    }
+
+    const source = countsByUser.size > 0 ? countsByUser : fallbackByCurrentAssignee;
+    const counts = new Map<string, number>();
+    for (const [assigneeId, issueKeys] of source.entries()) {
+      counts.set(assigneeId, issueKeys.size);
+    }
+
+    return {
+      counts,
+      truncated
+    };
   }
 
   private defaultAllowedValues(

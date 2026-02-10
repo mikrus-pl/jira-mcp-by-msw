@@ -10,7 +10,7 @@ MCP server for Jira Cloud with a constrained data abstraction, designed to avoid
 
 ## What It Does
 
-This server exposes eleven tools:
+This server exposes twelve tools:
 
 1. `jira_get_issue`
 2. `jira_create_issue`
@@ -19,10 +19,11 @@ This server exposes eleven tools:
 5. `jira_add_comment`
 6. `jira_link_issue`
 7. `jira_project_baseline`
-8. `jira_list_sprints`
-9. `jira_assign_issue_to_sprint`
-10. `jira_search_issues_by_jql`
-11. `jira_search_issues`
+8. `jira_project_assignable_users`
+9. `jira_list_sprints`
+10. `jira_assign_issue_to_sprint`
+11. `jira_search_issues_by_jql`
+12. `jira_search_issues`
 
 All tools intentionally use a focused issue model:
 
@@ -192,6 +193,8 @@ Key permissions to verify:
 
 - For `jira_get_issue`, `jira_search_issues`, `jira_search_issues_by_jql`, `jira_project_baseline`
   - Browse projects and issue visibility (including issue security levels).
+- For `jira_project_assignable_users`
+  - Browse users and groups (global Jira permission), plus project visibility for assignable scope.
 - For `jira_create_issue`
   - Create issues in target project.
 - For `jira_update_issue`
@@ -348,6 +351,11 @@ Output:
 - issue types (with textual descriptions)
 - priorities (id + name + description)
 - versions (only unreleased and not archived)
+- top assignable users (15, active only), ranked by number of distinct issues assigned in last 60 days:
+  - `id` (Jira accountId)
+  - `name` (displayName)
+  - `email` (can be `null` when hidden by Atlassian privacy settings)
+  - `assignedIssuesLast60Days` (ranking score)
 - severity context:
   - whether severity is configured
   - configured field id / JQL field / value type
@@ -364,6 +372,22 @@ Notes on workflow transitions:
 - Jira does not expose a single small “authoritative transition graph” for a project without pulling large workflow payloads.
 - This server infers a compact `from -> to` list by sampling transitions from recently updated issues per status.
 - Coverage metrics help you see how complete the inferred graph is for that issue type.
+
+### `jira_project_assignable_users`
+Input:
+
+- required: `projectKey`
+- required: `maxResults` (1..200)
+- optional: `startAt` (pagination offset, default `0`)
+
+Output:
+
+- active assignable users for the project in compact shape:
+  - `id` (Jira accountId)
+  - `name` (displayName)
+  - `email` (can be `null`)
+- metadata: `projectKey`, `activeOnly`, `maxResults`, `startAt`
+- this tool returns a paged list; use it when the baseline top-15 does not include the user you need
 
 ### `jira_list_sprints`
 Input:

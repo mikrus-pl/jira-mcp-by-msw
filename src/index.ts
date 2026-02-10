@@ -10,6 +10,7 @@ import type {
   AssignIssueToSprintInput,
   CreateIssueInput,
   IssueReadOptions,
+  ListProjectAssignableUsersInput,
   ListSprintsInput,
   LinkIssueInput,
   SearchIssuesByJqlInput,
@@ -231,13 +232,39 @@ server.registerTool(
   {
     title: "Get Project Baseline",
     description:
-      "Return compressed project baseline: issue types, priorities, versions, field profile, active sprints, and workflow transitions.",
+      "Return compressed project baseline: issue types, priorities, versions, top-15 assignable users (by issues assigned in last 60 days), field profile, active sprints, and workflow transitions.",
     inputSchema: {
       projectKey: nonEmpty.describe("Project key, e.g. PROJ")
     }
   },
   async ({ projectKey }) =>
     runTool(async () => ({ baseline: await jira.getProjectBaseline(projectKey) }))
+);
+
+server.registerTool(
+  "jira_project_assignable_users",
+  {
+    title: "List Project Assignable Users",
+    description:
+      "List active assignable users for a project in a compact paged shape (id, name, email). Use when baseline top-15 is not enough.",
+    inputSchema: {
+      projectKey: nonEmpty.describe("Project key, e.g. PROJ"),
+      maxResults: z
+        .number()
+        .int()
+        .min(1)
+        .max(200)
+        .describe("How many users to return (1..200)."),
+      startAt: z
+        .number()
+        .int()
+        .min(0)
+        .optional()
+        .describe("Pagination offset. Default: 0.")
+    }
+  },
+  async (args) =>
+    runTool(async () => jira.listProjectAssignableUsers(args as ListProjectAssignableUsersInput))
 );
 
 server.registerTool(
