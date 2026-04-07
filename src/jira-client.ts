@@ -6,19 +6,25 @@ import type {
   AssignableUser,
   AssignIssueToSprintInput,
   AssignIssueToSprintResult,
+  BaselineSectionName,
   BusinessFieldName,
   CompactIssueRef,
   CreateIssueInput,
   CreateIssueResult,
   DescriptionFormat,
   FocusedIssue,
+  GetIssueWorkflowInput,
+  GetIssueWorkflowResult,
   IssueComment,
   IssueCommentsMeta,
   IssueDescription,
+  IssueLinkTypeSummary,
   IssueReadOptions,
   IssueRef,
   IssueTransitionResult,
+  IssueUserRef,
   JqlIssueListItem,
+  ListIssueLinkTypesResult,
   ListSprintsInput,
   ListSprintsResult,
   ListProjectAssignableUsersInput,
@@ -30,6 +36,8 @@ import type {
   SearchIssuesByJqlResult,
   SearchIssuesInput,
   SearchIssuesResult,
+  SetIssueParentInput,
+  SetIssueParentResult,
   SprintStateFilter,
   TransitionIssueInput,
   TransitionIssueResult,
@@ -42,6 +50,7 @@ const BUSINESS_FIELDS: BusinessFieldName[] = [
   "description",
   "fixVersions",
   "affectedVersions",
+  "labels",
   "priority",
   "severity"
 ];
@@ -51,6 +60,12 @@ const JQL_RESULTS_TRUNCATED_NOTICE = "Results truncated because results exceeded
 interface JiraIssueResponse {
   key: string;
   fields: Record<string, unknown>;
+}
+
+interface JiraTransitionDiagnosticIssueResponse extends JiraIssueResponse {
+  fields: Record<string, unknown> & {
+    updated?: string;
+  };
 }
 
 interface JiraProjectResponse {
@@ -150,7 +165,10 @@ interface JiraLegacySearchResponse {
 interface JiraIssueChangelogItem {
   field?: string;
   fieldId?: string;
+  from?: string;
+  fromString?: string;
   to?: string;
+  toString?: string;
 }
 
 interface JiraIssueChangelogHistory {
@@ -168,6 +186,14 @@ interface JiraLegacySearchWithChangelogResponse {
   issues?: JiraIssueWithChangelogResponse[];
   total?: number;
   startAt?: number;
+}
+
+interface JiraIssueChangelogPageResponse {
+  values?: JiraIssueChangelogHistory[];
+  total?: number;
+  startAt?: number;
+  maxResults?: number;
+  isLast?: boolean;
 }
 
 interface JiraCommentResponse {
@@ -194,6 +220,9 @@ interface JiraPriority {
 
 interface JiraPrioritySearchResponse {
   values?: JiraPriority[];
+  isLast?: boolean;
+  startAt?: number;
+  maxResults?: number;
 }
 
 interface JiraUser {
@@ -253,6 +282,16 @@ export class JiraApiError extends Error {
   }
 }
 
+export class JiraToolExecutionError extends Error {
+  constructor(
+    message: string,
+    public readonly details?: Record<string, unknown>
+  ) {
+    super(message);
+    this.name = "JiraToolExecutionError";
+  }
+}
+
 export class JiraClient {
   constructor(private readonly config: JiraConfig) {}
 
@@ -279,12 +318,18 @@ export class JiraClient {
     const issueTypeId = await this.resolveIssueTypeId(input.projectKey, input.issueType);
     const fixVersionIds = await this.resolveVersionIds(input.projectKey, input.fixVersions);
     const affectedVersionIds = await this.resolveVersionIds(input.projectKey, input.affectedVersions);
+    const assigneePayload = await this.buildAssigneeCreateValue(input.projectKey, input.assignee);
 
     const fields: Record<string, unknown> = {
       project: { key: input.projectKey },
       issuetype: { id: issueTypeId },
       summary: input.summary
     };
+
+    const parentIssueKey = this.normalizeString(input.parentIssueKey);
+    if (parentIssueKey) {
+      fields.parent = { key: parentIssueKey };
+    }
 
     if (input.description !== undefined) {
       fields.description = this.toJiraDescription(input.description, input.descriptionFormat);
@@ -296,6 +341,14 @@ export class JiraClient {
 
     if (affectedVersionIds.length > 0) {
       fields.versions = affectedVersionIds.map((id) => ({ id }));
+    }
+
+    if (input.labels !== undefined) {
+      fields.labels = this.normalizeLabels(input.labels);
+    }
+
+    if (assigneePayload) {
+      fields.assignee = assigneePayload;
     }
 
     const priorityPayload = this.buildPriorityPayload(input.priority);
@@ -318,17 +371,11 @@ export class JiraClient {
       body: JSON.stringify({ fields })
     });
 
-    let transition: IssueTransitionResult | undefined;
-    if (input.status) {
-      transition = await this.tryTransitionIssue(created.key, input.status);
-    }
-
     const issue = await this.getIssue(created.key, {
       ...(input.descriptionFormat ? { descriptionFormat: input.descriptionFormat } : {})
     });
     return {
-      issue,
-      ...(transition ? { transition } : {})
+      issue
     };
   }
 
@@ -352,7 +399,9 @@ export class JiraClient {
     }
 
     const needsProjectKey =
-      input.fixVersions !== undefined || input.affectedVersions !== undefined;
+      input.fixVersions !== undefined ||
+      input.affectedVersions !== undefined ||
+      input.assignee !== undefined;
 
     let projectKey: string | undefined;
     if (needsProjectKey) {
@@ -375,6 +424,15 @@ export class JiraClient {
       fields.versions = affectedVersionIds.map((id) => ({ id }));
     }
 
+    if (input.labels !== undefined) {
+      fields.labels = this.normalizeLabels(input.labels);
+    }
+
+    const assigneeUpdateValue = await this.buildAssigneeUpdateValue(projectKey, input.assignee);
+    if (assigneeUpdateValue !== undefined) {
+      fields.assignee = assigneeUpdateValue;
+    }
+
     const priorityUpdateValue = this.buildPriorityUpdateValue(input.priority);
     if (priorityUpdateValue !== undefined) {
       fields.priority = priorityUpdateValue;
@@ -390,8 +448,8 @@ export class JiraClient {
       fields[this.config.severityFieldId] = severityUpdateValue;
     }
 
-    if (Object.keys(fields).length === 0 && !input.status) {
-      throw new Error("No changes requested. Provide at least one field to update or status.");
+    if (Object.keys(fields).length === 0) {
+      throw new Error("No changes requested. Provide at least one field to update.");
     }
 
     if (Object.keys(fields).length > 0) {
@@ -409,11 +467,6 @@ export class JiraClient {
       );
     }
 
-    let transition: IssueTransitionResult | undefined;
-    if (input.status) {
-      transition = await this.tryTransitionIssue(issueKey, input.status);
-    }
-
     const issueReadOptions: IssueReadOptions = {
       ...(typeof input.skipComments === "boolean"
         ? { skipComments: input.skipComments }
@@ -426,10 +479,7 @@ export class JiraClient {
 
     const issue = await this.getIssue(issueKey, issueReadOptions);
 
-    return {
-      issue,
-      ...(transition ? { transition } : {})
-    };
+    return { issue };
   }
 
   async transitionIssue(input: TransitionIssueInput): Promise<TransitionIssueResult> {
@@ -448,6 +498,32 @@ export class JiraClient {
     return {
       issue,
       transition
+    };
+  }
+
+  async getIssueWorkflow(input: GetIssueWorkflowInput): Promise<GetIssueWorkflowResult> {
+    const snapshot = await this.fetchIssueWorkflowSnapshot(input.issueKey);
+    const transitions = await this.listIssueTransitions(input.issueKey);
+    const lastStatusChangeAt = await this.findLastStatusChangeAt(input.issueKey);
+
+    return {
+      issue: {
+        key: snapshot.key,
+        url: this.buildIssueBrowseUrl(snapshot.key),
+        summary: snapshot.summary,
+        projectKey: snapshot.projectKey,
+        issueType: snapshot.issueType,
+        status: snapshot.status,
+        parent: snapshot.parent,
+        updatedAt: snapshot.updatedAt,
+        lastStatusChangeAt
+      },
+      availableTransitions: transitions.map((transition) => ({
+        id: this.normalizeString(transition.id) ?? null,
+        name: this.normalizeString(transition.name) ?? null,
+        targetStatus:
+          this.normalizeString(transition.to?.name) ?? this.normalizeString(transition.name) ?? null
+      }))
     };
   }
 
@@ -472,6 +548,28 @@ export class JiraClient {
     return {
       issueKey,
       comment: this.toIssueComment(comment)
+    };
+  }
+
+  async listIssueLinkTypes(): Promise<ListIssueLinkTypesResult> {
+    const linkTypes = await this.fetchIssueLinkTypes();
+
+    return {
+      linkTypes: linkTypes
+        .map((linkType): IssueLinkTypeSummary | null => {
+          const name = this.normalizeString(linkType.name);
+          if (!name) {
+            return null;
+          }
+
+          return {
+            id: this.normalizeString(linkType.id) ?? null,
+            name,
+            inward: this.normalizeString(linkType.inward) ?? null,
+            outward: this.normalizeString(linkType.outward) ?? null
+          };
+        })
+        .filter((value): value is IssueLinkTypeSummary => Boolean(value))
     };
   }
 
@@ -522,120 +620,111 @@ export class JiraClient {
     };
   }
 
+  async setIssueParent(input: SetIssueParentInput): Promise<SetIssueParentResult> {
+    const issueKey = input.issueKey.trim();
+    if (!issueKey) {
+      throw new Error("issueKey cannot be empty.");
+    }
+
+    if (input.parentIssueKey === undefined) {
+      throw new Error("Provide parentIssueKey or null to clear the parent relation.");
+    }
+
+    const parentIssueKey =
+      input.parentIssueKey === null ? null : this.normalizeString(input.parentIssueKey);
+
+    if (parentIssueKey === issueKey) {
+      throw new Error("issue cannot be its own parent.");
+    }
+
+    const query = new URLSearchParams({ returnIssue: "false" });
+    const body =
+      parentIssueKey === null
+        ? {
+            update: {
+              parent: [{ set: { none: true } }]
+            }
+          }
+        : {
+            fields: {
+              parent: {
+                key: parentIssueKey
+              }
+            }
+          };
+
+    await this.request<void>(`/rest/api/3/issue/${encodeURIComponent(issueKey)}?${query.toString()}`, {
+      method: "PUT",
+      body: JSON.stringify(body)
+    });
+
+    const issue = await this.getIssue(issueKey, {
+      ...(typeof input.skipComments === "boolean" ? { skipComments: input.skipComments } : {}),
+      ...(typeof input.loadOnlyLast3Comments === "boolean"
+        ? { loadOnlyLast3Comments: input.loadOnlyLast3Comments }
+        : {}),
+      ...(input.descriptionFormat ? { descriptionFormat: input.descriptionFormat } : {})
+    });
+
+    return {
+      issue,
+      parent: issue.parent
+    };
+  }
+
   async searchIssues(input: SearchIssuesInput): Promise<SearchIssuesResult> {
     const jql = this.buildJql(input);
     const issueFields = this.getIssueFields();
+    const body: Record<string, unknown> = {
+      jql,
+      maxResults: input.maxResults ?? 25,
+      fields: issueFields,
+      fieldsByKeys: false
+    };
 
-    try {
-      const body: Record<string, unknown> = {
-        jql,
-        maxResults: input.maxResults ?? 25,
-        fields: issueFields,
-        fieldsByKeys: false
-      };
-
-      if (input.nextPageToken) {
-        body.nextPageToken = input.nextPageToken;
-      }
-
-      const response = await this.request<JiraEnhancedSearchResponse>("/rest/api/3/search/jql", {
-        method: "POST",
-        body: JSON.stringify(body)
-      });
-
-      const issues = (response.issues ?? []).map((issue) => this.toFocusedIssue(issue));
-
-      return {
-        jql,
-        issues,
-        nextPageToken: response.nextPageToken ?? null,
-        mode: "enhanced"
-      };
-    } catch (error) {
-      if (!(error instanceof JiraApiError) || error.status !== 404) {
-        throw error;
-      }
-
-      const startAt = parseNextPageToken(input.nextPageToken);
-
-      const response = await this.request<JiraLegacySearchResponse>("/rest/api/3/search", {
-        method: "POST",
-        body: JSON.stringify({
-          jql,
-          maxResults: input.maxResults ?? 25,
-          startAt,
-          fields: issueFields,
-          fieldsByKeys: false
-        })
-      });
-
-      const issues = (response.issues ?? []).map((issue) => this.toFocusedIssue(issue));
-      const nextStart = (response.startAt ?? 0) + issues.length;
-      const total = response.total ?? 0;
-
-      return {
-        jql,
-        issues,
-        nextPageToken: nextStart < total ? String(nextStart) : null,
-        mode: "legacy"
-      };
+    if (input.nextPageToken) {
+      body.nextPageToken = input.nextPageToken;
     }
+
+    const response = await this.request<JiraEnhancedSearchResponse>("/rest/api/3/search/jql", {
+      method: "POST",
+      body: JSON.stringify(body)
+    });
+
+    const issues = (response.issues ?? []).map((issue) => this.toFocusedIssue(issue));
+
+    return {
+      jql,
+      issues,
+      nextPageToken: response.nextPageToken ?? null,
+      mode: "enhanced"
+    };
   }
 
   async searchIssuesByJql(input: SearchIssuesByJqlInput): Promise<SearchIssuesByJqlResult> {
     const jql = this.buildStrictJql(input.jql);
     const issueFields = this.getIssueListFields();
-
-    try {
-      const response = await this.request<JiraEnhancedSearchResponse>("/rest/api/3/search/jql", {
-        method: "POST",
-        body: JSON.stringify({
-          jql,
-          maxResults: 51,
-          fields: issueFields,
-          fieldsByKeys: false
-        })
-      });
-
-      const rawIssues = response.issues ?? [];
-      const truncated = rawIssues.length > 50 || Boolean(response.nextPageToken);
-      const issues = rawIssues.slice(0, 50).map((issue) => this.toJqlIssueListItem(issue));
-
-      return {
+    const response = await this.request<JiraEnhancedSearchResponse>("/rest/api/3/search/jql", {
+      method: "POST",
+      body: JSON.stringify({
         jql,
-        issues,
-        truncated,
-        notice: truncated ? JQL_RESULTS_TRUNCATED_NOTICE : null,
-        mode: "enhanced"
-      };
-    } catch (error) {
-      if (!(error instanceof JiraApiError) || error.status !== 404) {
-        throw error;
-      }
+        maxResults: 51,
+        fields: issueFields,
+        fieldsByKeys: false
+      })
+    });
 
-      const response = await this.request<JiraLegacySearchResponse>("/rest/api/3/search", {
-        method: "POST",
-        body: JSON.stringify({
-          jql,
-          maxResults: 51,
-          startAt: 0,
-          fields: issueFields,
-          fieldsByKeys: false
-        })
-      });
+    const rawIssues = response.issues ?? [];
+    const truncated = rawIssues.length > 50 || Boolean(response.nextPageToken);
+    const issues = rawIssues.slice(0, 50).map((issue) => this.toJqlIssueListItem(issue));
 
-      const rawIssues = response.issues ?? [];
-      const truncated = (response.total ?? 0) > 50 || rawIssues.length > 50;
-      const issues = rawIssues.slice(0, 50).map((issue) => this.toJqlIssueListItem(issue));
-
-      return {
-        jql,
-        issues,
-        truncated,
-        notice: truncated ? JQL_RESULTS_TRUNCATED_NOTICE : null,
-        mode: "legacy"
-      };
-    }
+    return {
+      jql,
+      issues,
+      truncated,
+      notice: truncated ? JQL_RESULTS_TRUNCATED_NOTICE : null,
+      mode: "enhanced"
+    };
   }
 
   async listSprints(input: ListSprintsInput): Promise<ListSprintsResult> {
@@ -750,6 +839,17 @@ export class JiraClient {
     const projectName = this.requireString(project.name, "Missing project name in Jira response.");
 
     const notes: string[] = [];
+    const integritySections: ProjectBaseline["integrity"]["sections"] = [
+      { section: "project", state: "ok", message: null },
+      { section: "issueTypes", state: "ok", message: null }
+    ];
+    const recordIntegrity = (
+      section: BaselineSectionName,
+      state: ProjectBaseline["integrity"]["sections"][number]["state"],
+      message: string | null = null
+    ) => {
+      integritySections.push({ section, state, message });
+    };
 
     const issueTypes = (project.issueTypes ?? [])
       .map((issueType) => {
@@ -769,15 +869,17 @@ export class JiraClient {
     let priorities: ProjectBaseline["priorities"] = [];
     try {
       priorities = await this.fetchPriorities(projectId);
+      recordIntegrity("priorities", "ok");
     } catch (error) {
-      notes.push(`Priorities lookup unavailable: ${toErrorMessage(error)}`);
+      recordIntegrity("priorities", "unavailable", toErrorMessage(error));
     }
 
     let versions: ProjectBaseline["versions"] = [];
     try {
       versions = await this.fetchProjectVersions(projectKey);
+      recordIntegrity("versions", "ok");
     } catch (error) {
-      notes.push(`Versions lookup unavailable: ${toErrorMessage(error)}`);
+      recordIntegrity("versions", "unavailable", toErrorMessage(error));
     }
 
     let assignableUsers: ProjectBaseline["assignableUsers"] = [];
@@ -788,12 +890,25 @@ export class JiraClient {
       });
       assignableUsers = topAssignableUsers.users;
       if (topAssignableUsers.truncated) {
-        notes.push(
-          "Assignable users ranking used a bounded scan window for recent issue history; ranking may be partial."
+        recordIntegrity(
+          "assignableUsers",
+          "partial",
+          "Ranking used a bounded scan window for recent issue history; ranking may be partial."
         );
+      } else if (
+        topAssignableUsers.scannedIssues > 0 &&
+        topAssignableUsers.assigneeTransitionsObserved === 0
+      ) {
+        recordIntegrity(
+          "assignableUsers",
+          "partial",
+          "No assignee transition events were observed in scanned issues from the last 60 days; ranking is based on zero transition scores."
+        );
+      } else {
+        recordIntegrity("assignableUsers", "ok");
       }
     } catch (error) {
-      notes.push(`Assignable users lookup unavailable: ${toErrorMessage(error)}`);
+      recordIntegrity("assignableUsers", "unavailable", toErrorMessage(error));
     }
 
     let workflowIssueTypeStatuses: WorkflowIssueTypeStatus[] = [];
@@ -834,49 +949,50 @@ export class JiraClient {
           };
         })
         .filter((value): value is NonNullable<typeof value> => Boolean(value));
+      recordIntegrity("workflowStatuses", "ok");
     } catch (error) {
-      notes.push(`Workflow status lookup unavailable: ${toErrorMessage(error)}`);
+      recordIntegrity("workflowStatuses", "unavailable", toErrorMessage(error));
     }
 
     let fieldProfile: ProjectBaseline["fieldProfile"] = [];
     try {
       fieldProfile = await this.buildFieldProfile(projectKey, issueTypes, priorities, versions);
+      recordIntegrity("fieldProfile", "ok");
     } catch (error) {
-      notes.push(`Field profile lookup unavailable: ${toErrorMessage(error)}`);
-      fieldProfile = issueTypes.map((issueType) => ({
-        issueType: {
-          id: issueType.id,
-          name: issueType.name
-        },
-        fields: BUSINESS_FIELDS.map((field) => ({
-          field,
-          required: field === "summary",
-          supported: field !== "severity" || Boolean(this.config.severityFieldId),
-          allowedValues: this.defaultAllowedValues(field, priorities, versions)
-        }))
-      }));
+      recordIntegrity("fieldProfile", "unavailable", toErrorMessage(error));
     }
 
     let issueTypeFlows: ProjectBaseline["workflow"]["issueTypeFlows"] = [];
     try {
       issueTypeFlows = await this.buildIssueTypeFlows(projectKey, workflowIssueTypeStatuses);
+      recordIntegrity("workflowTransitions", "ok");
     } catch (error) {
-      notes.push(`Workflow transitions lookup unavailable: ${toErrorMessage(error)}`);
+      recordIntegrity("workflowTransitions", "unavailable", toErrorMessage(error));
     }
 
     let activeSprints: ProjectBaseline["activeSprints"] = [];
     try {
       activeSprints = await this.fetchActiveSprints(projectKey);
+      recordIntegrity("activeSprints", "ok");
     } catch (error) {
-      notes.push(`Active sprint lookup unavailable: ${toErrorMessage(error)}`);
+      recordIntegrity("activeSprints", "unavailable", toErrorMessage(error));
     }
 
     let severity: ProjectBaseline["severity"] = this.defaultSeverityContext();
-    try {
-      severity = await this.buildSeverityContext(projectKey);
-    } catch (error) {
-      notes.push(`Severity lookup unavailable: ${toErrorMessage(error)}`);
+    if (!this.config.severityFieldId) {
+      recordIntegrity("severity", "ok", "Severity field is not configured for this server.");
+    } else {
+      try {
+        severity = await this.buildSeverityContext(projectKey);
+        recordIntegrity("severity", "ok");
+      } catch (error) {
+        recordIntegrity("severity", "unavailable", toErrorMessage(error));
+      }
     }
+
+    const integrityStatus = integritySections.some((section) => section.state !== "ok")
+      ? "partial"
+      : "complete";
 
     return {
       project: {
@@ -894,6 +1010,10 @@ export class JiraClient {
       workflow: {
         issueTypeFlows
       },
+      integrity: {
+        status: integrityStatus,
+        sections: integritySections
+      },
       notes
     };
   }
@@ -905,9 +1025,17 @@ export class JiraClient {
     versions: ProjectBaseline["versions"]
   ): Promise<ProjectBaseline["fieldProfile"]> {
     const metaByIssueType = await this.fetchCreateMetaFieldMap(projectKey);
+    if (issueTypes.length > 0 && metaByIssueType.size === 0) {
+      throw new Error("Create metadata did not return field definitions for any issue type.");
+    }
 
     return issueTypes.map((issueType) => {
       const fieldsMeta = metaByIssueType.get(issueType.id);
+      if (!fieldsMeta) {
+        throw new Error(
+          `Create metadata is missing field definitions for issue type ${issueType.name} (${issueType.id}).`
+        );
+      }
 
       return {
         issueType: {
@@ -917,17 +1045,16 @@ export class JiraClient {
         fields: BUSINESS_FIELDS.map((field) => {
           const jiraFieldKey = this.getJiraFieldKeyForBusinessField(field);
           const metaField = jiraFieldKey ? fieldsMeta?.[jiraFieldKey] : undefined;
-
-          const defaultRequired = field === "summary";
-          const defaultSupported = field !== "severity" || Boolean(this.config.severityFieldId);
           const defaultAllowed = this.defaultAllowedValues(field, priorities, versions);
           const allowedFromMeta = this.extractAllowedValues(metaField?.allowedValues);
+          const severityConfigured = field !== "severity" || Boolean(this.config.severityFieldId);
+          const supported = Boolean(metaField) && severityConfigured;
 
           return {
             field,
-            required: metaField?.required ?? defaultRequired,
-            supported: Boolean(metaField) || defaultSupported,
-            allowedValues: allowedFromMeta.length > 0 ? allowedFromMeta : defaultAllowed
+            required: metaField?.required ?? false,
+            supported,
+            allowedValues: supported ? (allowedFromMeta.length > 0 ? allowedFromMeta : defaultAllowed) : []
           };
         })
       };
@@ -1103,9 +1230,14 @@ export class JiraClient {
   }
 
   private async fetchPriorities(projectId: string): Promise<ProjectBaseline["priorities"]> {
-    try {
+    const priorities: ProjectBaseline["priorities"] = [];
+    let startAt = 0;
+    const maxResults = 100;
+
+    while (true) {
       const query = new URLSearchParams({
-        maxResults: "100",
+        maxResults: String(maxResults),
+        startAt: String(startAt),
         projectId
       });
 
@@ -1113,31 +1245,8 @@ export class JiraClient {
         `/rest/api/3/priority/search?${query.toString()}`
       );
 
-      const priorities = (response.values ?? [])
+      const batch = (response.values ?? [])
         .map((priority) => {
-          if (!priority.id || !priority.name) {
-            return null;
-          }
-
-          return {
-            id: priority.id,
-            name: priority.name,
-            description: priority.description?.trim() ?? ""
-          };
-        })
-        .filter((value): value is NonNullable<typeof value> => Boolean(value));
-
-      if (priorities.length > 0) {
-        return priorities;
-      }
-    } catch {
-      // fallback below
-    }
-
-    const fallback = await this.request<JiraPriority[]>("/rest/api/3/priority");
-
-    return fallback
-      .map((priority) => {
         if (!priority.id || !priority.name) {
           return null;
         }
@@ -1149,6 +1258,17 @@ export class JiraClient {
         };
       })
       .filter((value): value is NonNullable<typeof value> => Boolean(value));
+
+      priorities.push(...batch);
+
+      if (response.isLast === true || batch.length === 0) {
+        break;
+      }
+
+      startAt += response.maxResults ?? batch.length;
+    }
+
+    return priorities;
   }
 
   private async fetchProjectVersions(projectKey: string): Promise<ProjectBaseline["versions"]> {
@@ -1214,33 +1334,14 @@ export class JiraClient {
     startAt: number
   ): Promise<JiraUser[]> {
     const query = new URLSearchParams({
-      project: projectKey,
+      projectKeys: projectKey,
       maxResults: String(maxResults),
       startAt: String(startAt)
     });
 
-    let users: JiraUser[];
-    try {
-      users = await this.request<JiraUser[]>(
-        `/rest/api/3/user/assignable/search?${query.toString()}`
-      );
-    } catch (error) {
-      if (!(error instanceof JiraApiError) || error.status !== 400) {
-        throw error;
-      }
-
-      const fallbackQuery = new URLSearchParams({
-        projectKey,
-        maxResults: String(maxResults),
-        startAt: String(startAt)
-      });
-
-      users = await this.request<JiraUser[]>(
-        `/rest/api/3/user/assignable/search?${fallbackQuery.toString()}`
-      );
-    }
-
-    return users;
+    return this.request<JiraUser[]>(
+      `/rest/api/3/user/assignable/multiProjectSearch?${query.toString()}`
+    );
   }
 
   private toActiveAssignableUsers(users: JiraUser[]): AssignableUser[] {
@@ -1303,12 +1404,19 @@ export class JiraClient {
   private async fetchTopAssignableUsersByRecentAssignments(
     projectKey: string,
     options: { days: number; limit: number }
-  ): Promise<{ users: AssignableUser[]; truncated: boolean }> {
+  ): Promise<{
+    users: AssignableUser[];
+    truncated: boolean;
+    scannedIssues: number;
+    assigneeTransitionsObserved: number;
+  }> {
     const assignableUsers = await this.fetchAllProjectAssignableUsers(projectKey, 1000);
     if (assignableUsers.length === 0) {
       return {
         users: [],
-        truncated: false
+        truncated: false,
+        scannedIssues: 0,
+        assigneeTransitionsObserved: 0
       };
     }
 
@@ -1330,20 +1438,27 @@ export class JiraClient {
 
     return {
       users: scoredUsers.slice(0, Math.max(1, options.limit)),
-      truncated: recentCounts.truncated
+      truncated: recentCounts.truncated,
+      scannedIssues: recentCounts.scannedIssues,
+      assigneeTransitionsObserved: recentCounts.assigneeTransitionsObserved
     };
   }
 
   private async countRecentAssignedIssuesByUser(
     projectKey: string,
     days: number
-  ): Promise<{ counts: Map<string, number>; truncated: boolean }> {
+  ): Promise<{
+    counts: Map<string, number>;
+    truncated: boolean;
+    scannedIssues: number;
+    assigneeTransitionsObserved: number;
+  }> {
     const now = Date.now();
     const windowStartMs = now - Math.max(1, days) * 24 * 60 * 60 * 1000;
     const pageSize = 50;
     const maxIssuesToScan = 500;
     const countsByUser = new Map<string, Set<string>>();
-    const fallbackByCurrentAssignee = new Map<string, Set<string>>();
+    let assigneeTransitionsObserved = 0;
 
     let startAt = 0;
     let total = Number.POSITIVE_INFINITY;
@@ -1388,15 +1503,6 @@ export class JiraClient {
       for (const issue of issues) {
         const issueKey = issue.key;
 
-        const currentAssigneeId = this.normalizeString(
-          (issue.fields.assignee as Record<string, unknown> | undefined)?.accountId
-        );
-        if (currentAssigneeId) {
-          const set = fallbackByCurrentAssignee.get(currentAssigneeId) ?? new Set<string>();
-          set.add(issueKey);
-          fallbackByCurrentAssignee.set(currentAssigneeId, set);
-        }
-
         for (const history of issue.changelog?.histories ?? []) {
           const createdMs = Date.parse(history.created ?? "");
           if (!Number.isFinite(createdMs) || createdMs < windowStartMs || createdMs > now) {
@@ -1418,7 +1524,11 @@ export class JiraClient {
             }
 
             const set = countsByUser.get(assigneeId) ?? new Set<string>();
+            const beforeSize = set.size;
             set.add(issueKey);
+            if (set.size > beforeSize) {
+              assigneeTransitionsObserved += 1;
+            }
             countsByUser.set(assigneeId, set);
           }
         }
@@ -1427,15 +1537,16 @@ export class JiraClient {
       startAt += issues.length;
     }
 
-    const source = countsByUser.size > 0 ? countsByUser : fallbackByCurrentAssignee;
     const counts = new Map<string, number>();
-    for (const [assigneeId, issueKeys] of source.entries()) {
+    for (const [assigneeId, issueKeys] of countsByUser.entries()) {
       counts.set(assigneeId, issueKeys.size);
     }
 
     return {
       counts,
-      truncated
+      truncated,
+      scannedIssues,
+      assigneeTransitionsObserved
     };
   }
 
@@ -1453,6 +1564,21 @@ export class JiraClient {
     }
 
     return [];
+  }
+
+  private normalizeLabels(labels: string[]): string[] {
+    const deduped = new Set<string>();
+
+    for (const label of labels) {
+      const normalized = label.trim();
+      if (!normalized) {
+        continue;
+      }
+
+      deduped.add(normalized);
+    }
+
+    return [...deduped];
   }
 
   private extractAllowedValues(values: unknown[] | undefined): string[] {
@@ -1776,15 +1902,15 @@ export class JiraClient {
 
     const sprintCollections = await Promise.all(
       boards.map(async (board) => {
+        const sprintQuery = new URLSearchParams({
+          maxResults: String(maxResultsPerBoard)
+        });
+
+        if (stateQuery) {
+          sprintQuery.set("state", stateQuery);
+        }
+
         try {
-          const sprintQuery = new URLSearchParams({
-            maxResults: String(maxResultsPerBoard)
-          });
-
-          if (stateQuery) {
-            sprintQuery.set("state", stateQuery);
-          }
-
           const response = await this.request<JiraSprintSearchResponse>(
             `/rest/agile/1.0/board/${board.id}/sprint?${sprintQuery.toString()}`
           );
@@ -1792,8 +1918,10 @@ export class JiraClient {
           return (response.values ?? [])
             .map((sprint) => this.toSprintSummary(sprint, board))
             .filter((value): value is NonNullable<typeof value> => Boolean(value));
-        } catch {
-          return [];
+        } catch (error) {
+          throw new Error(
+            `Unable to load sprints for board '${board.name}' (${board.id}): ${toErrorMessage(error)}`
+          );
         }
       })
     );
@@ -2222,10 +2350,13 @@ export class JiraClient {
       "description",
       "fixVersions",
       "versions",
+      "labels",
       "status",
       "priority",
       "issuetype",
       "project",
+      "assignee",
+      "reporter",
       "parent",
       "subtasks",
       "issuelinks"
@@ -2323,6 +2454,103 @@ export class JiraClient {
     return [...resolved];
   }
 
+  private async buildAssigneeCreateValue(
+    projectKey: string,
+    assignee: string | undefined
+  ): Promise<{ id: string } | undefined> {
+    const normalized = assignee?.trim();
+    if (!normalized) {
+      return undefined;
+    }
+
+    const resolved = await this.resolveAssignableUser(projectKey, normalized);
+    return { id: resolved.id };
+  }
+
+  private async buildAssigneeUpdateValue(
+    projectKey: string | undefined,
+    assignee: string | null | undefined
+  ): Promise<{ id: string } | null | undefined> {
+    if (assignee === undefined) {
+      return undefined;
+    }
+
+    if (assignee === null) {
+      return null;
+    }
+
+    const normalized = assignee.trim();
+    if (!normalized) {
+      return null;
+    }
+
+    if (!projectKey) {
+      throw new Error("Cannot update assignee: issue project key is unavailable.");
+    }
+
+    const resolved = await this.resolveAssignableUser(projectKey, normalized);
+    return { id: resolved.id };
+  }
+
+  private async resolveAssignableUser(
+    projectKey: string,
+    requested: string
+  ): Promise<AssignableUser> {
+    const users = await this.fetchAllProjectAssignableUsers(projectKey, 1000);
+    const normalizedRequested = requested.trim().toLowerCase();
+
+    const byId = users.find((user) => user.id.toLowerCase() === normalizedRequested);
+    if (byId) {
+      return byId;
+    }
+
+    const emailMatches = users.filter(
+      (user) => (user.email ?? "").trim().toLowerCase() === normalizedRequested
+    );
+    if (emailMatches.length === 1) {
+      const first = emailMatches[0];
+      if (!first) {
+        throw new Error("Unexpected assignee selection error.");
+      }
+      return first;
+    }
+
+    if (emailMatches.length > 1) {
+      throw new Error(
+        `Assignee '${requested}' is ambiguous by email in project ${projectKey}. Use Jira accountId.`
+      );
+    }
+
+    const nameMatches = users.filter((user) => user.name.trim().toLowerCase() === normalizedRequested);
+    if (nameMatches.length === 1) {
+      const first = nameMatches[0];
+      if (!first) {
+        throw new Error("Unexpected assignee selection error.");
+      }
+      return first;
+    }
+
+    if (nameMatches.length > 1) {
+      const matches = nameMatches
+        .slice(0, 10)
+        .map((user) => `${user.id}:${user.name}`)
+        .join(", ");
+
+      throw new Error(
+        `Assignee '${requested}' is ambiguous in project ${projectKey}. Matching users: ${matches}. Use Jira accountId.`
+      );
+    }
+
+    const preview = users
+      .slice(0, 15)
+      .map((user) => `${user.id}:${user.name}`)
+      .join(", ");
+
+    throw new Error(
+      `Assignable user '${requested}' not found in project ${projectKey}. Use Jira accountId, exact display name, or exact email. Known users: ${preview || "(none)"}.`
+    );
+  }
+
   private buildPriorityPayload(priority: string | undefined): { id: string } | { name: string } | undefined {
     const normalized = priority?.trim();
 
@@ -2408,14 +2636,21 @@ export class JiraClient {
     const requestedStatus = status.trim();
 
     if (!requestedStatus) {
-      return {
-        requestedStatus: status,
-        applied: false,
-        reason: "Requested status is empty."
-      };
+      throw new Error("Requested status cannot be empty.");
     }
 
-    const transitions = await this.listIssueTransitions(issueKey);
+    let transitions: JiraTransition[];
+    try {
+      transitions = await this.listIssueTransitions(issueKey);
+    } catch (error) {
+      throw await this.buildTransitionFailureError(
+        issueKey,
+        requestedStatus,
+        `Unable to load available transitions: ${toErrorMessage(error)}`,
+        []
+      );
+    }
+
     const normalizedRequested = requestedStatus.toLowerCase();
 
     const matched = transitions.find((transition) => {
@@ -2431,26 +2666,31 @@ export class JiraClient {
     });
 
     if (!matched?.id) {
-      const available = transitions
-        .map((transition) => transition.to?.name ?? transition.name)
-        .filter((value): value is string => Boolean(value))
-        .join(", ");
-
-      return {
+      throw await this.buildTransitionFailureError(
+        issueKey,
         requestedStatus,
-        applied: false,
-        reason: `No matching transition found. Available target statuses: ${available || "(none)"}.`
-      };
+        `No matching transition found for requested status '${requestedStatus}'.`,
+        transitions
+      );
     }
 
-    await this.request<void>(`/rest/api/3/issue/${encodeURIComponent(issueKey)}/transitions`, {
-      method: "POST",
-      body: JSON.stringify({
-        transition: {
-          id: matched.id
-        }
-      })
-    });
+    try {
+      await this.request<void>(`/rest/api/3/issue/${encodeURIComponent(issueKey)}/transitions`, {
+        method: "POST",
+        body: JSON.stringify({
+          transition: {
+            id: matched.id
+          }
+        })
+      });
+    } catch (error) {
+      throw await this.buildTransitionFailureError(
+        issueKey,
+        requestedStatus,
+        `Transition '${requestedStatus}' failed: ${toErrorMessage(error)}`,
+        transitions
+      );
+    }
 
     return {
       requestedStatus,
@@ -2460,6 +2700,157 @@ export class JiraClient {
         ? { targetStatus: matched.to?.name ?? matched.name }
         : {})
     };
+  }
+
+  private async buildTransitionFailureError(
+    issueKey: string,
+    requestedStatus: string,
+    message: string,
+    transitions: JiraTransition[]
+  ): Promise<JiraToolExecutionError> {
+    const details = await this.buildTransitionFailureDetails(issueKey, requestedStatus, message, transitions);
+    return new JiraToolExecutionError(message, details);
+  }
+
+  private async buildTransitionFailureDetails(
+    issueKey: string,
+    requestedStatus: string,
+    message: string,
+    transitions: JiraTransition[]
+  ): Promise<Record<string, unknown>> {
+    const diagnostics: Record<string, unknown> = {
+      error: {
+        code: "jira_transition_unavailable",
+        message,
+        requestedStatus,
+        issueKey,
+        issueUrl: this.buildIssueBrowseUrl(issueKey)
+      }
+    };
+
+    try {
+      const [issueSnapshot, lastStatusChangeAt] = await Promise.all([
+        this.fetchTransitionDiagnosticIssue(issueKey),
+        this.findLastStatusChangeAt(issueKey)
+      ]);
+
+      diagnostics.error = {
+        ...(diagnostics.error as Record<string, unknown>),
+        issue: issueSnapshot,
+        currentStatus: issueSnapshot.status,
+        updatedAt: issueSnapshot.updatedAt,
+        lastStatusChangeAt
+      };
+    } catch (error) {
+      diagnostics.error = {
+        ...(diagnostics.error as Record<string, unknown>),
+        diagnosticsWarning: `Unable to load fresh issue diagnostics: ${toErrorMessage(error)}`
+      };
+    }
+
+    diagnostics.error = {
+      ...(diagnostics.error as Record<string, unknown>),
+      availableTransitions: transitions.map((transition) => ({
+        id: this.normalizeString(transition.id) ?? null,
+        name: this.normalizeString(transition.name) ?? null,
+        targetStatus: this.normalizeString(transition.to?.name) ?? this.normalizeString(transition.name) ?? null
+      }))
+    };
+
+    return diagnostics;
+  }
+
+  private async fetchTransitionDiagnosticIssue(issueKey: string): Promise<Record<string, unknown>> {
+    const issue = await this.fetchIssueWorkflowSnapshot(issueKey);
+
+    return {
+      key: issue.key,
+      url: this.buildIssueBrowseUrl(issue.key),
+      summary: issue.summary,
+      status: issue.status,
+      parent: issue.parent,
+      issueType: issue.issueType,
+      projectKey: issue.projectKey,
+      updatedAt: issue.updatedAt
+    };
+  }
+
+  private async fetchIssueWorkflowSnapshot(issueKey: string): Promise<{
+    key: string;
+    summary: string;
+    projectKey: string | null;
+    issueType: IssueRef | null;
+    status: FocusedIssue["status"];
+    parent: CompactIssueRef | null;
+    updatedAt: string | null;
+  }> {
+    const query = new URLSearchParams({
+      fields: ["summary", "status", "updated", "project", "issuetype", "parent"].join(","),
+      fieldsByKeys: "false"
+    });
+
+    const issue = await this.request<JiraTransitionDiagnosticIssueResponse>(
+      `/rest/api/3/issue/${encodeURIComponent(issueKey)}?${query.toString()}`
+    );
+
+    return {
+      key: issue.key,
+      summary: this.normalizeString(issue.fields.summary) ?? "",
+      projectKey: this.normalizeString((issue.fields.project as Record<string, unknown> | undefined)?.key) ?? null,
+      issueType: this.extractIssueRef(issue.fields.issuetype as Record<string, unknown> | undefined),
+      status: this.extractStatus(issue.fields.status as Record<string, unknown> | undefined),
+      parent: this.toCompactIssueRef(issue.fields.parent),
+      updatedAt: this.normalizeString(issue.fields.updated) ?? null
+    };
+  }
+
+  private async findLastStatusChangeAt(issueKey: string): Promise<string | null> {
+    const pageSize = 100;
+    let startAt = 0;
+    let total = 0;
+    let initialized = false;
+
+    while (true) {
+      const query = new URLSearchParams({
+        startAt: String(startAt),
+        maxResults: String(pageSize)
+      });
+
+      const page = await this.request<JiraIssueChangelogPageResponse>(
+        `/rest/api/3/issue/${encodeURIComponent(issueKey)}/changelog?${query.toString()}`
+      );
+
+      const histories = page.values ?? [];
+      if (!initialized) {
+        total = page.total ?? histories.length;
+        startAt = Math.max(0, total - pageSize);
+        initialized = true;
+
+        if (startAt > 0) {
+          continue;
+        }
+      }
+
+      for (const history of [...histories].reverse()) {
+        const statusChanged = (history.items ?? []).some((item) => {
+          const fieldKey =
+            normalizeLabelForMatch(this.normalizeString(item.field)) ||
+            normalizeLabelForMatch(this.normalizeString(item.fieldId));
+
+          return fieldKey === "status";
+        });
+
+        if (statusChanged) {
+          return this.normalizeString(history.created) ?? null;
+        }
+      }
+
+      if (startAt === 0) {
+        return null;
+      }
+
+      startAt = Math.max(0, startAt - pageSize);
+    }
   }
 
   private toFocusedIssue(
@@ -2490,11 +2881,14 @@ export class JiraClient {
       description: this.toDescriptionOutput(fields.description, descriptionFormat),
       fixVersions: this.extractNameList(fields.fixVersions),
       affectedVersions: this.extractNameList(fields.versions),
+      labels: this.extractStringArray(fields.labels),
       status: this.extractStatus(statusRaw),
       priority: this.extractIssueRef(priorityRaw),
       severity: this.extractScalarValue(severityRaw),
       issueType: this.extractIssueRef(issueTypeRaw),
       projectKey: this.normalizeString(projectRaw?.key) ?? null,
+      assignee: this.extractIssueUser(fields.assignee),
+      reporter: this.extractIssueUser(fields.reporter),
       parent: this.toCompactIssueRef(fields.parent),
       subtasks: this.extractIssueRefsFromArray(fields.subtasks),
       linkedIssues: this.extractLinkedIssues(fields.issuelinks),
@@ -2750,6 +3144,16 @@ export class JiraClient {
       .filter((item): item is string => Boolean(item));
   }
 
+  private extractStringArray(value: unknown): string[] {
+    if (!Array.isArray(value)) {
+      return [];
+    }
+
+    return value
+      .map((entry) => this.normalizeString(entry))
+      .filter((item): item is string => Boolean(item));
+  }
+
   private extractSprintNames(value: unknown): string[] {
     const names = new Set<string>();
     const entries = Array.isArray(value) ? value : [value];
@@ -2805,6 +3209,30 @@ export class JiraClient {
     return {
       ...(id ? { id } : {}),
       ...(name ? { name } : {})
+    };
+  }
+
+  private extractIssueUser(value: unknown): IssueUserRef | null {
+    if (!value || typeof value !== "object") {
+      return null;
+    }
+
+    const user = value as Record<string, unknown>;
+    const id = this.normalizeString(user.accountId) ?? this.normalizeString(user.id);
+    const name =
+      this.normalizeString(user.displayName) ??
+      this.normalizeString(user.name) ??
+      this.normalizeString(user.emailAddress);
+    const email = this.normalizeString(user.emailAddress);
+
+    if (!id && !name && !email) {
+      return null;
+    }
+
+    return {
+      ...(id ? { id } : {}),
+      ...(name ? { name } : {}),
+      ...(email ? { email } : {})
     };
   }
 
@@ -2942,19 +3370,6 @@ export class JiraClient {
       clearTimeout(timeout);
     }
   }
-}
-
-function parseNextPageToken(token: string | undefined): number {
-  if (!token) {
-    return 0;
-  }
-
-  const parsed = Number.parseInt(token, 10);
-  if (!Number.isFinite(parsed) || parsed < 0) {
-    throw new Error(`Invalid nextPageToken '${token}' for legacy Jira search.`);
-  }
-
-  return parsed;
 }
 
 async function safeReadBody(response: Response): Promise<string> {

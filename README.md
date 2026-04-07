@@ -10,20 +10,23 @@ MCP server for Jira Cloud with a constrained data abstraction, designed to avoid
 
 ## What It Does
 
-This server exposes twelve tools:
+This server exposes fifteen tools:
 
 1. `jira_get_issue`
 2. `jira_create_issue`
 3. `jira_update_issue`
 4. `jira_transition_issue`
-5. `jira_add_comment`
-6. `jira_link_issue`
-7. `jira_project_baseline`
-8. `jira_project_assignable_users`
-9. `jira_list_sprints`
-10. `jira_assign_issue_to_sprint`
-11. `jira_search_issues_by_jql`
-12. `jira_search_issues`
+5. `jira_get_issue_workflow`
+6. `jira_add_comment`
+7. `jira_list_issue_link_types`
+8. `jira_link_issue`
+9. `jira_set_issue_parent`
+10. `jira_project_baseline`
+11. `jira_project_assignable_users`
+12. `jira_list_sprints`
+13. `jira_assign_issue_to_sprint`
+14. `jira_search_issues_by_jql`
+15. `jira_search_issues`
 
 All tools intentionally use a focused issue model:
 
@@ -32,9 +35,12 @@ All tools intentionally use a focused issue model:
 - `description` (default plain text; optional ADF mode for read/write)
 - `fixVersions`
 - `affectedVersions`
+- `labels`
 - `status`
 - `priority`
 - `severity` (mapped via configurable field)
+- `assignee`
+- `reporter`
 - `parent` / `subtasks` / `linkedIssues`
 - `comments` (default: last 3 only for context protection)
 
@@ -42,6 +48,15 @@ All tools intentionally use a focused issue model:
 
 - Node.js 22+
 - Jira Cloud account + API token (or a pre-built `Authorization` header)
+
+## Supported Jira APIs
+
+This server targets Jira Cloud only and uses:
+
+- Jira Cloud Platform REST API `v3`
+- Jira Software Cloud REST API `agile/1.0` for boards and sprints
+
+The implementation intentionally uses one documented API family per capability and does not silently fall back to alternate search or user/priority lookup variants.
 
 ## Configuration
 
@@ -202,10 +217,16 @@ Key permissions to verify:
   - Edit issues.
 - For `jira_transition_issue`
   - Transition issues.
+- For `jira_get_issue_workflow`
+  - Browse project and transition visibility for the issue.
 - For `jira_add_comment`
   - Add comments.
+- For `jira_list_issue_link_types`
+  - Browse Jira configuration relevant to issue link types.
 - For `jira_link_issue`
   - Link issues.
+- For `jira_set_issue_parent`
+  - Edit issues and permission to change parent hierarchy where Jira allows it.
 - For `jira_list_sprints`
   - Access Scrum board(s) and their sprints.
 - For `jira_assign_issue_to_sprint`
@@ -263,6 +284,9 @@ Output:
 
 - one focused issue object including:
   - `url` (clickable Jira issue link)
+  - `assignee` (`id`, `name`, optional `email`)
+  - `reporter` (`id`, `name`, optional `email`)
+  - `labels`
   - `description` in the requested format
   - `parent`, `subtasks`, `linkedIssues` (each with own `url`)
   - `comments` (plain text bodies)
@@ -273,7 +297,10 @@ Output:
 Input:
 
 - required: `projectKey`, `issueType`, `summary`
-- optional: `description`, `descriptionFormat`, `fixVersions`, `affectedVersions`, `priority`, `severity`, `status`
+- optional: `description`, `descriptionFormat`, `fixVersions`, `affectedVersions`, `labels`, `priority`, `severity`, `assignee`, `parentIssueKey`
+- `assignee` accepts Jira accountId, exact display name, or exact email
+- `labels` is the full label set to write on create
+- `parentIssueKey` creates a child/sub-task relation when the Jira issue type and project configuration allow it
 
 Description mode:
 
@@ -284,13 +311,15 @@ Description mode:
 Behavior:
 
 - creates issue
-- if `status` is provided, tries transition after creation
+- status changes are intentionally **not** part of create; use `jira_transition_issue` after creation when workflow movement is required
 
 ### `jira_update_issue`
 Input:
 
 - required: `issueKey`
-- optional updates: `summary`, `description`, `descriptionFormat`, `fixVersions`, `affectedVersions`, `priority`, `severity`, `status`
+- optional updates: `summary`, `description`, `descriptionFormat`, `fixVersions`, `affectedVersions`, `labels`, `priority`, `severity`, `assignee`
+- `assignee` accepts Jira accountId, exact display name, or exact email; use `null` to clear
+- `labels` replaces the current label set; use `[]` to clear
 - optional flags for returned issue: `skipComments`, `loadOnlyLast3Comments`
 
 Description mode:
@@ -303,7 +332,7 @@ Description mode:
 Behavior:
 
 - updates issue fields via Jira `Edit issue`
-- if `status` is provided, applies transition as a second step
+- status changes are intentionally **not** part of update; use `jira_transition_issue`
 - sprint assignment is intentionally **not** done here (Jira ignores sprint updates in many setups via issue edit); use `jira_assign_issue_to_sprint`
 
 ### `jira_transition_issue`
@@ -317,6 +346,24 @@ Behavior:
 
 - applies workflow transition only (dedicated tool)
 - returns transition result + focused issue
+- if the target transition is unavailable or Jira rejects it, returns an MCP tool error (`isError: true`) with current status, timestamps, and available transitions
+
+### `jira_get_issue_workflow`
+Input:
+
+- required: `issueKey`
+
+Output:
+
+- runtime workflow information for one issue:
+  - current status
+  - issue type
+  - parent
+  - issue updated timestamp
+  - last detected status-change timestamp
+  - exact transitions currently available from Jira for that issue
+
+Use this tool before `jira_transition_issue` when you want an exact preflight for workflow movement on a specific ticket.
 
 ### `jira_add_comment`
 Input:
@@ -328,6 +375,21 @@ Behavior:
 
 - adds a Jira comment as ADF (converted from plain text)
 - returns created comment in focused shape
+
+### `jira_list_issue_link_types`
+Input:
+
+- no input
+
+Output:
+
+- available Jira issue link relations for this instance:
+  - `name`
+  - `inward`
+  - `outward`
+  - optional `id`
+
+Use this tool to discover valid relation labels before calling `jira_link_issue`.
 
 ### `jira_link_issue`
 Input:
@@ -341,6 +403,19 @@ Behavior:
 
 - creates issue link using business relation label
 - returns normalized relation, link type, direction, and clickable issue URLs (`issueUrl`, `targetIssueUrl`)
+
+### `jira_set_issue_parent`
+Input:
+
+- required: `issueKey`
+- required: `parentIssueKey` or `null`
+- optional response controls: `skipComments`, `loadOnlyLast3Comments`, `descriptionFormat`
+
+Behavior:
+
+- sets the parent relation for an issue when Jira allows it
+- use `parentIssueKey: null` to clear the relation
+- returns refreshed focused issue data including the resulting `parent`
 
 ### `jira_project_baseline`
 Input:
@@ -358,16 +433,24 @@ Output:
   - `name` (displayName)
   - `email` (can be `null` when hidden by Atlassian privacy settings)
   - `assignedIssuesLast60Days` (ranking score)
+  - if no assignee transition events are observed in the scanned 60-day window, `integrity.sections` marks `assignableUsers` as `partial` with an explicit message (no fallback to current assignee)
 - severity context:
   - whether severity is configured
   - configured field id / JQL field / value type
   - allowed severity options with textual descriptions (when Jira metadata provides them)
-- field profile for business fields (`summary`, `description`, `fixVersions`, `affectedVersions`, `priority`, `severity`)
+- field profile for business fields (`summary`, `description`, `fixVersions`, `affectedVersions`, `labels`, `priority`, `severity`)
 - active sprint(s) from Scrum boards, each with contextual description text (goal/state/dates/board)
 - workflow per issue type:
   - compact statuses list
   - compact `from -> to` transitions list (business-oriented)
   - coverage metrics (how many statuses had sample issues/transitions)
+- `integrity`:
+  - `status`: `complete` or `partial`
+  - `sections`: per-section status for `priorities`, `versions`, `assignableUsers`, `severity`, `fieldProfile`, `activeSprints`, `workflowStatuses`, `workflowTransitions`
+  - each section reports `state` (`ok` | `partial` | `unavailable`) and a machine-readable message
+- `notes`:
+  - informational only
+  - not used to hide missing contract data
 
 Notes on workflow transitions:
 
@@ -389,6 +472,7 @@ Output:
   - `name` (displayName)
   - `email` (can be `null`)
 - metadata: `projectKey`, `activeOnly`, `maxResults`, `startAt`
+- Jira Cloud returns assignable users from the first 1000-user window only; the page may contain fewer rows than `maxResults`
 - this tool returns a paged list; use it when the baseline top-15 does not include the user you need
 
 ### `jira_list_sprints`
@@ -568,7 +652,16 @@ If JQL is invalid, Jira returns an API error (for example syntax error), and the
 - Jira comments are also ADF in Cloud API; server returns/sends plain text at tool boundary.
 - Default comment loading mode is last 3 comments to protect LLM context.
 - Severity is not a standard Jira system field in many projects; configure custom field mapping in env.
-- Search defaults to the enhanced endpoint and falls back to legacy endpoint if needed.
+
+## Error Handling
+
+This server follows the MCP tool error model:
+
+- malformed MCP requests and unknown tools are protocol-level errors
+- Jira/API failures, validation failures, and business-rule failures are returned as MCP tool execution errors with `isError: true`
+- tool execution errors include actionable payloads that a client or agent can use to retry safely
+
+In particular, workflow transition failures are returned as tool execution errors, not as successful tool results with a business warning. When a transition fails, the server returns fresh diagnostics for the issue, including current status, timestamps, and currently available transitions.
 
 ## Troubleshooting
 

@@ -4,17 +4,19 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import * as z from "zod/v4";
 import { loadJiraConfig } from "./config.js";
-import { JiraApiError, JiraClient } from "./jira-client.js";
+import { JiraApiError, JiraClient, JiraToolExecutionError } from "./jira-client.js";
 import type {
   AddCommentInput,
   AssignIssueToSprintInput,
   CreateIssueInput,
+  GetIssueWorkflowInput,
   IssueReadOptions,
   ListProjectAssignableUsersInput,
   ListSprintsInput,
   LinkIssueInput,
   SearchIssuesByJqlInput,
   SearchIssuesInput,
+  SetIssueParentInput,
   TransitionIssueInput,
   UpdateIssueInput
 } from "./types.js";
@@ -87,6 +89,9 @@ server.registerTool(
       affectedVersions: nonEmptyArray
         .optional()
         .describe("Optional list of project version names or ids for affected versions."),
+      labels: nonEmptyArray
+        .optional()
+        .describe("Optional list of Jira labels to set on the issue."),
       priority: z
         .string()
         .trim()
@@ -99,12 +104,18 @@ server.registerTool(
         .min(1)
         .optional()
         .describe("Optional severity value (requires JIRA_SEVERITY_FIELD_ID)."),
-      status: z
+      assignee: z
         .string()
         .trim()
         .min(1)
         .optional()
-        .describe("Optional target status name or transition id applied after issue creation.")
+        .describe("Optional assignee: Jira accountId, exact display name, or exact email."),
+      parentIssueKey: z
+        .string()
+        .trim()
+        .min(1)
+        .optional()
+        .describe("Optional parent issue key used to create a child/sub-task relationship.")
     }
   },
   async (args) => runTool(async () => jira.createIssue(args as CreateIssueInput))
@@ -115,7 +126,7 @@ server.registerTool(
   {
     title: "Update Jira Issue",
     description:
-      "Update focused Jira fields. Description supports plain_text (default) or ADF; optional status transition.",
+      "Update focused Jira fields. Description supports plain_text (default) or ADF.",
     inputSchema: {
       issueKey: nonEmpty.describe("Jira issue key, e.g. PROJ-123"),
       summary: z.string().trim().min(1).optional(),
@@ -132,6 +143,9 @@ server.registerTool(
       affectedVersions: nonEmptyArray
         .optional()
         .describe("Set affected versions by version names/ids. Use [] to clear."),
+      labels: nonEmptyArray
+        .optional()
+        .describe("Set Jira labels. Use [] to clear."),
       priority: z
         .string()
         .trim()
@@ -146,12 +160,15 @@ server.registerTool(
         .nullable()
         .optional()
         .describe("Severity value. Use null to clear (requires JIRA_SEVERITY_FIELD_ID)."),
-      status: z
+      assignee: z
         .string()
         .trim()
         .min(1)
+        .nullable()
         .optional()
-        .describe("Optional target status name or transition id."),
+        .describe(
+          "Assignee update. Use Jira accountId, exact display name, or exact email. Use null to clear."
+        ),
       notifyUsers: z
         .boolean()
         .optional()
@@ -193,6 +210,19 @@ server.registerTool(
 );
 
 server.registerTool(
+  "jira_get_issue_workflow",
+  {
+    title: "Get Jira Issue Workflow",
+    description:
+      "Return workflow-focused runtime data for one issue: current status, last status change, and currently available transitions.",
+    inputSchema: {
+      issueKey: nonEmpty.describe("Jira issue key, e.g. PROJ-123")
+    }
+  },
+  async (args) => runTool(async () => jira.getIssueWorkflow(args as GetIssueWorkflowInput))
+);
+
+server.registerTool(
   "jira_add_comment",
   {
     title: "Add Jira Comment",
@@ -204,6 +234,17 @@ server.registerTool(
     }
   },
   async (args) => runTool(async () => jira.addComment(args as AddCommentInput))
+);
+
+server.registerTool(
+  "jira_list_issue_link_types",
+  {
+    title: "List Jira Issue Link Types",
+    description:
+      "List available Jira issue link relations for this instance (name, inward label, outward label).",
+    inputSchema: {}
+  },
+  async () => runTool(async () => jira.listIssueLinkTypes())
 );
 
 server.registerTool(
@@ -225,6 +266,35 @@ server.registerTool(
     }
   },
   async (args) => runTool(async () => jira.linkIssue(args as LinkIssueInput))
+);
+
+server.registerTool(
+  "jira_set_issue_parent",
+  {
+    title: "Set Jira Issue Parent",
+    description:
+      "Set or clear the parent issue relation for one Jira issue and return refreshed focused issue data.",
+    inputSchema: {
+      issueKey: nonEmpty.describe("Jira issue key, e.g. PROJ-123"),
+      parentIssueKey: z
+        .string()
+        .trim()
+        .min(1)
+        .nullable()
+        .optional()
+        .describe("Target parent issue key. Use null to clear the parent relation."),
+      skipComments: z
+        .boolean()
+        .optional()
+        .describe("If true, do not load comments in the returned issue. Default: false."),
+      loadOnlyLast3Comments: z
+        .boolean()
+        .optional()
+        .describe("If true, return only 3 most recent comments in returned issue. Default: true."),
+      descriptionFormat: descriptionFormatSchema
+    }
+  },
+  async (args) => runTool(async () => jira.setIssueParent(args as SetIssueParentInput))
 );
 
 server.registerTool(
@@ -402,6 +472,10 @@ async function runTool<T>(operation: () => Promise<T>) {
   try {
     const payload = await operation();
     return {
+      structuredContent:
+        payload && typeof payload === "object" && !Array.isArray(payload)
+          ? (payload as Record<string, unknown>)
+          : undefined,
       content: [
         {
           type: "text" as const,
@@ -410,6 +484,24 @@ async function runTool<T>(operation: () => Promise<T>) {
       ]
     };
   } catch (error) {
+    if (error instanceof JiraToolExecutionError) {
+      const details =
+        error.details && typeof error.details === "object" && !Array.isArray(error.details)
+          ? error.details
+          : { error: { message: error.message } };
+
+      return {
+        isError: true,
+        structuredContent: details,
+        content: [
+          {
+            type: "text" as const,
+            text: JSON.stringify(details, null, 2)
+          }
+        ]
+      };
+    }
+
     return {
       isError: true,
       content: [

@@ -3,6 +3,12 @@ export interface IssueRef {
   name?: string;
 }
 
+export interface IssueUserRef {
+  id?: string;
+  name?: string;
+  email?: string | null;
+}
+
 export type DescriptionFormat = "plain_text" | "adf";
 export type IssueDescription = string | Record<string, unknown>;
 
@@ -59,6 +65,7 @@ export interface FocusedIssue {
   description: IssueDescription;
   fixVersions: string[];
   affectedVersions: string[];
+  labels: string[];
   status: {
     id?: string;
     name?: string;
@@ -68,6 +75,8 @@ export interface FocusedIssue {
   severity: string | null;
   issueType: IssueRef | null;
   projectKey: string | null;
+  assignee: IssueUserRef | null;
+  reporter: IssueUserRef | null;
   parent: CompactIssueRef | null;
   subtasks: CompactIssueRef[];
   linkedIssues: LinkedIssueRef[];
@@ -91,14 +100,15 @@ export interface CreateIssueInput {
   descriptionFormat?: DescriptionFormat;
   fixVersions?: string[];
   affectedVersions?: string[];
+  labels?: string[];
   priority?: string;
   severity?: string;
-  status?: string;
+  assignee?: string;
+  parentIssueKey?: string;
 }
 
 export interface CreateIssueResult {
   issue: FocusedIssue;
-  transition?: IssueTransitionResult;
 }
 
 export interface UpdateIssueInput extends IssueReadOptions {
@@ -108,15 +118,15 @@ export interface UpdateIssueInput extends IssueReadOptions {
   descriptionFormat?: DescriptionFormat;
   fixVersions?: string[];
   affectedVersions?: string[];
+  labels?: string[];
   priority?: string | null;
   severity?: string | null;
-  status?: string;
+  assignee?: string | null;
   notifyUsers?: boolean;
 }
 
 export interface UpdateIssueResult {
   issue: FocusedIssue;
-  transition?: IssueTransitionResult;
 }
 
 export interface TransitionIssueInput extends IssueReadOptions {
@@ -154,6 +164,52 @@ export interface LinkIssueResult {
   relation: string;
   linkType: string;
   direction: "outward" | "inward";
+}
+
+export interface IssueLinkTypeSummary {
+  id: string | null;
+  name: string;
+  inward: string | null;
+  outward: string | null;
+}
+
+export interface ListIssueLinkTypesResult {
+  linkTypes: IssueLinkTypeSummary[];
+}
+
+export interface SetIssueParentInput extends IssueReadOptions {
+  issueKey: string;
+  parentIssueKey?: string | null;
+}
+
+export interface SetIssueParentResult {
+  issue: FocusedIssue;
+  parent: CompactIssueRef | null;
+}
+
+export interface IssueWorkflowTransition {
+  id: string | null;
+  name: string | null;
+  targetStatus: string | null;
+}
+
+export interface GetIssueWorkflowInput {
+  issueKey: string;
+}
+
+export interface GetIssueWorkflowResult {
+  issue: {
+    key: string;
+    url: string;
+    summary: string;
+    projectKey: string | null;
+    issueType: IssueRef | null;
+    status: FocusedIssue["status"];
+    parent: CompactIssueRef | null;
+    updatedAt: string | null;
+    lastStatusChangeAt: string | null;
+  };
+  availableTransitions: IssueWorkflowTransition[];
 }
 
 export interface SearchIssuesInput {
@@ -270,8 +326,23 @@ export type BusinessFieldName =
   | "description"
   | "fixVersions"
   | "affectedVersions"
+  | "labels"
   | "priority"
   | "severity";
+
+export type BaselineSectionName =
+  | "project"
+  | "issueTypes"
+  | "priorities"
+  | "versions"
+  | "assignableUsers"
+  | "severity"
+  | "fieldProfile"
+  | "activeSprints"
+  | "workflowStatuses"
+  | "workflowTransitions";
+
+export type BaselineSectionState = "ok" | "partial" | "unavailable";
 
 export interface ProjectBaseline {
   project: {
@@ -343,6 +414,14 @@ export interface ProjectBaseline {
         statusesWithSample: number;
         statusesWithTransitions: number;
       };
+    }>;
+  };
+  integrity: {
+    status: "complete" | "partial";
+    sections: Array<{
+      section: BaselineSectionName;
+      state: BaselineSectionState;
+      message: string | null;
     }>;
   };
   notes: string[];
